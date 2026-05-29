@@ -1,0 +1,62 @@
+\ Model three_bus_stackelberg_kkt_copy
+\ LP format - for model browsing. Use MPS format to capture full model detail.
+\ Signature: 0x1451f5fd2a8c56eb
+Minimize
+ 
+Subject To
+ energy_neutral_DR_Bus_R1: dL[Bus_R1,0] + dL[Bus_R1,1] = 0
+ local_balance_Bus_R1_0: P_buy[Bus_R1,0] - P_sell[Bus_R1,0] - dL[Bus_R1,0]
+   - P_ch[Bus_R1,0] + P_dis[Bus_R1,0] = 13.42238
+ soc_dyn_0: - 0.2375 P_ch[Bus_R1,0] + 0.2631578947368421 P_dis[Bus_R1,0]
+   - SOC[Bus_R1,0] + SOC[Bus_R1,1] = 0
+ local_balance_Bus_R1_1: P_buy[Bus_R1,1] - P_sell[Bus_R1,1] - dL[Bus_R1,1]
+   - P_ch[Bus_R1,1] + P_dis[Bus_R1,1] = 9.109504999999999
+ soc_dyn_1: - 0.2375 P_ch[Bus_R1,1] + 0.2631578947368421 P_dis[Bus_R1,1]
+   - SOC[Bus_R1,1] + SOC[Bus_R1,2] = 0
+ soc_initial: SOC[Bus_R1,0] = 6
+ soc_terminal: SOC[Bus_R1,2] = 6
+ energy_neutral_DR_Bus_R6: dL[Bus_R6,0] + dL[Bus_R6,1] = 0
+ local_balance_Bus_R6_0: P_buy[Bus_R6,0] - P_sell[Bus_R6,0] - dL[Bus_R6,0]
+   = 4.3298
+ local_balance_Bus_R6_1: P_buy[Bus_R6,1] - P_sell[Bus_R6,1] - dL[Bus_R6,1]
+   = 2.93855
+ energy_neutral_DR_Bus_R9: dL[Bus_R9,0] + dL[Bus_R9,1] = 0
+ local_balance_Bus_R9_0: P_buy[Bus_R9,0] - P_sell[Bus_R9,0] - dL[Bus_R9,0]
+   = 2.91534
+ local_balance_Bus_R9_1: P_buy[Bus_R9,1] - P_sell[Bus_R9,1] - dL[Bus_R9,1]
+   = 2.740884
+ line_flow_0_0: - P_buy[Bus_R1,0] - P_buy[Bus_R6,0] - P_buy[Bus_R9,0]
+   + P_sell[Bus_R1,0] + P_sell[Bus_R6,0] + P_sell[Bus_R9,0] + P_line[0,0]
+   = 0
+ line_max_0_0: P_line[0,0] <= 16.56
+ line_flow_0_1: - P_buy[Bus_R1,1] - P_buy[Bus_R6,1] - P_buy[Bus_R9,1]
+   + P_sell[Bus_R1,1] + P_sell[Bus_R6,1] + P_sell[Bus_R9,1] + P_line[0,1]
+   = 0
+ line_max_0_1: P_line[0,1] <= 16.56
+Bounds
+ P_buy[Bus_R1,0] free
+ P_buy[Bus_R1,1] free
+ P_buy[Bus_R6,0] free
+ P_buy[Bus_R6,1] free
+ P_buy[Bus_R9,0] free
+ P_buy[Bus_R9,1] free
+ P_sell[Bus_R1,0] free
+ P_sell[Bus_R1,1] free
+ P_sell[Bus_R6,0] free
+ P_sell[Bus_R6,1] free
+ P_sell[Bus_R9,0] free
+ P_sell[Bus_R9,1] free
+ dL[Bus_R1,0] free
+ dL[Bus_R1,1] free
+ dL[Bus_R6,0] free
+ dL[Bus_R6,1] free
+ dL[Bus_R9,0] free
+ dL[Bus_R9,1] free
+ P_dis[Bus_R1,0] free
+ P_dis[Bus_R1,1] free
+ SOC[Bus_R1,0] free
+ SOC[Bus_R1,1] free
+ SOC[Bus_R1,2] free
+ P_line[0,0] free
+ P_line[0,1] free
+End
