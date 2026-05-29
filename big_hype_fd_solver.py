@@ -9,18 +9,13 @@ def project_prices(cfg, market, p_buy, p_sell):
     p_sell = np.clip(p_sell, 0.0, cfg.sell_discount * p_buy)
 
     for t in range(1, len(p_buy)):
-        if p_buy[t] - p_buy[t - 1] > cfg.ramp:
-            p_buy[t] = p_buy[t - 1] + cfg.ramp
-        if p_buy[t - 1] - p_buy[t] > cfg.ramp:
-            p_buy[t] = p_buy[t - 1] - cfg.ramp
-
-        if p_sell[t] - p_sell[t - 1] > cfg.ramp:
-            p_sell[t] = p_sell[t - 1] + cfg.ramp
-        if p_sell[t - 1] - p_sell[t] > cfg.ramp:
-            p_sell[t] = p_sell[t - 1] - cfg.ramp
-
+        p_buy[t] = min(p_buy[t], p_buy[t - 1] + cfg.ramp)
+        p_buy[t] = max(p_buy[t], p_buy[t - 1] - cfg.ramp)
         p_buy[t] = np.clip(p_buy[t], market[t], market[t] + cfg.max_markup)
         p_buy[t] = np.clip(p_buy[t], cfg.p_min, cfg.p_max)
+
+        p_sell[t] = min(p_sell[t], p_sell[t - 1] + cfg.ramp)
+        p_sell[t] = max(p_sell[t], p_sell[t - 1] - cfg.ramp)
         p_sell[t] = np.clip(p_sell[t], 0.0, cfg.sell_discount * p_buy[t])
 
     return p_buy, p_sell
@@ -31,7 +26,7 @@ def solve_followers_given_price(cfg, data, p_buy, p_sell):
         import gurobipy as gp
         from gurobipy import GRB
     except ImportError as exc:
-        raise RuntimeError("需要安装 gurobipy。") from exc
+        raise RuntimeError("Please install gurobipy and configure a valid Gurobi license.") from exc
 
     T = cfg.horizon
     buses = list(data["buses"])
@@ -41,7 +36,7 @@ def solve_followers_given_price(cfg, data, p_buy, p_sell):
     battery_buses = [b for b in buses if b in cfg.battery_buses]
     pv_buses = [b for b in buses if np.max(pv[b]) > 1e-9]
 
-    m = gp.Model("follower_best_response")
+    m = gp.Model("followers_given_price")
     m.Params.OutputFlag = 0
     m.Params.NonConvex = 2
 
@@ -53,7 +48,13 @@ def solve_followers_given_price(cfg, data, p_buy, p_sell):
 
     ch = m.addVars(battery_buses, T, lb=0.0, ub=cfg.bat_pmax, name="P_ch")
     dis = m.addVars(battery_buses, T, lb=0.0, ub=cfg.bat_pmax, name="P_dis")
-    soc = m.addVars(battery_buses, T + 1, lb=cfg.soc_min, ub=cfg.soc_max, name="SOC")
+    soc = m.addVars(
+        battery_buses,
+        T + 1,
+        lb=cfg.soc_min,
+        ub=cfg.soc_max,
+        name="SOC",
+    )
 
     obj = 0.0
 
@@ -61,7 +62,10 @@ def solve_followers_given_price(cfg, data, p_buy, p_sell):
         has_pv = b in pv_buses
         has_bat = b in battery_buses
 
-        m.addConstr(gp.quicksum(dl[b, t] for t in range(T)) == 0.0, name=f"energy_neutral_{b}")
+        m.addConstr(
+            gp.quicksum(dl[b, t] for t in range(T)) == 0.0,
+            name=f"dr_energy_{b}",
+        )
 
         for t in range(T):
             dr_lim = 0.15 * load[b][t]
@@ -115,6 +119,7 @@ def solve_followers_given_price(cfg, data, p_buy, p_sell):
         return None
 
     schedules = {}
+
     for b in buses:
         schedules[b] = {
             "buy": np.array([buy[b, t].X for t in range(T)]),
@@ -123,35 +128,33 @@ def solve_followers_given_price(cfg, data, p_buy, p_sell):
             "curt": np.array([curt[b, t].X for t in range(T)]) if b in pv_buses else np.zeros(T),
             "ch": np.array([ch[b, t].X for t in range(T)]) if b in battery_buses else np.zeros(T),
             "dis": np.array([dis[b, t].X for t in range(T)]) if b in battery_buses else np.zeros(T),
+            "soc": np.array([soc[b, t].X for t in range(T + 1)]) if b in battery_buses else np.zeros(T + 1),
         }
 
-    agg = np.array([
+    agg_load = np.array([
         sum(schedules[b]["buy"][t] - schedules[b]["sell"][t] for b in buses)
         for t in range(T)
     ])
 
     return {
         "schedules": schedules,
-        "agg_load": agg,
+        "agg_load": agg_load,
     }
 
 
 def leader_objective(cfg, data, market, p_buy, p_sell, follower):
-    baseline = np.sum([data["load"][b] - data["pv"][b] for b in data["buses"]], axis=0)
+    buses = list(data["buses"])
+    baseline = np.sum([data["load"][b] - data["pv"][b] for b in buses], axis=0)
     lref = float(np.mean(baseline))
     agg = follower["agg_load"]
 
     retail_profit = 0.0
-    curt_sum = 0.0
+    curt_total = 0.0
 
-    for b in data["buses"]:
-        retail_profit += np.sum(
-            cfg.dt * (
-                p_buy * follower["schedules"][b]["buy"]
-                - p_sell * follower["schedules"][b]["sell"]
-            )
-        )
-        curt_sum += np.sum(follower["schedules"][b]["curt"])
+    for b in buses:
+        sch = follower["schedules"][b]
+        retail_profit += np.sum(cfg.dt * (p_buy * sch["buy"] - p_sell * sch["sell"]))
+        curt_total += np.sum(sch["curt"])
 
     wholesale_cost = np.sum(cfg.dt * market * agg)
     peak_pen = cfg.rho_peak * np.max(np.abs(agg))
@@ -164,24 +167,32 @@ def leader_objective(cfg, data, market, p_buy, p_sell, follower):
         )
     )
 
-    curt_pen = cfg.rho_curt * curt_sum
+    curt_pen = cfg.rho_curt * curt_total
 
     return wholesale_cost - retail_profit + peak_pen + flat_pen + price_reg + curt_pen
 
 
 def solve_big_hype_fd(cfg, data, market):
     """
-    BIG-Hype-like finite-difference test version.
+    BIG-Hype-like finite-difference solver.
 
-    注意：
-    这不是论文 BIG Hype 的完整 sensitivity learning 版本。
-    它只是用于和 SOS1 / Big-M / duality-based 做趋势比较。
+    This is not the full BIG Hype sensitivity-learning algorithm.
+    It is a simplified local hypergradient benchmark:
+
+        1. choose leader prices,
+        2. solve follower best response,
+        3. approximate leader hypergradient by finite difference,
+        4. update projected prices.
     """
-    start = time.time()
+    start_time = time.time()
     T = cfg.horizon
 
-    p_buy = np.clip(market + 0.03, cfg.p_min, cfg.p_max)
-    p_sell = cfg.sell_discount * market
+    rng = np.random.default_rng(int(getattr(cfg, "big_hype_seed", 0)))
+    jitter = float(getattr(cfg, "big_hype_init_jitter", 0.0))
+
+    p_buy = market + 0.03 + rng.uniform(-jitter, jitter, size=T)
+    p_sell = cfg.sell_discount * market + rng.uniform(-0.5 * jitter, 0.5 * jitter, size=T)
+
     p_buy, p_sell = project_prices(cfg, market, p_buy, p_sell)
 
     best = None
@@ -199,8 +210,8 @@ def solve_big_hype_fd(cfg, data, market):
             best = {
                 "method": "big_hype_fd",
                 "status": 1,
-                "runtime_sec": float(time.time() - start),
-                "mip_gap": 0.0,
+                "runtime_sec": float(time.time() - start_time),
+                "mip_gap": np.nan,
                 "obj_value": float(base_obj),
                 "price_buy": p_buy.copy(),
                 "price_sell": p_sell.copy(),
@@ -235,9 +246,10 @@ def solve_big_hype_fd(cfg, data, market):
 
         p_buy = p_buy - step * grad_buy
         p_sell = p_sell - step * grad_sell
+
         p_buy, p_sell = project_prices(cfg, market, p_buy, p_sell)
 
     if best is not None:
-        best["runtime_sec"] = float(time.time() - start)
+        best["runtime_sec"] = float(time.time() - start_time)
 
     return best
