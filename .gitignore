@@ -3,3 +3,15 @@ __pycache__/
 .vscode/
 outputs/
 *.pyc
+# 忽略常见图片格式
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.gif
+*.bmp
+*.tiff
+*.csv
+
+# 忽略所有名为 figures 的文件夹及其内容
+**/figures/
