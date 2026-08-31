@@ -7,7 +7,7 @@ import pandas as pd
 from p3_common import (
     BUS_CONFIG, BUS_ORDER, DEFAULT_SETTINGS, DT, T, day_frame, day_inputs,
     day_metrics, experiment_dates, load_fixed_simbench_day, plot_month,
-    read_pv_month, save_month, trip_vector,
+    read_pa_month, read_pv_month, save_month, select_export_price, trip_vector,
 )
 
 
@@ -87,24 +87,30 @@ def solve_day(date, loads, pv, settings):
 
 def main(settings):
     loads = load_fixed_simbench_day(settings)
+    pa_month = read_pa_month(settings)
     pv_month = read_pv_month(settings)
     frames, metrics = [], []
     for number, date in enumerate(experiment_dates(settings), 1):
-        _, pv, _ = day_inputs(date, loads, None, pv_month, settings)
+        _, pv, pa = day_inputs(date, loads, pa_month, pv_month, settings)
+        pb = np.full(T, settings["ACCOUNTING_PB_EUR_PER_KWH"])
         result = solve_day(date, loads, pv, settings)
-        frame = day_frame(date, loads, pv, result)
+        sell_price = select_export_price(pa, pb, settings["EXPORT_PRICE_MODE"])
+        for item in result.values():
+            item["sell_price"] = sell_price
+        frame = day_frame(date, loads, pv, result, pa, pb)
         frames.append(frame)
-        metrics.append(day_metrics("s4", date, frame, result))
+        metrics.append(day_metrics("s4", date, frame, result, pa, pb))
         print(f"S4 {number:02d}: {date.date()} complete")
 
     ts_path, metric_path = save_month("s4", frames, metrics)
     month_frame = pd.concat(frames, ignore_index=True)
     metric_frame = pd.DataFrame(metrics)
     figure = plot_month("s4", "Phase 3 S4: centralized benchmark",
-                        month_frame, metric_frame, show_price=False)
+                        month_frame, metric_frame, show_price=True)
     print(f"Timeseries: {ts_path}\nMetrics: {metric_path}\nFigure: {figure}")
 
 
 if __name__ == "__main__":
-    SETTINGS = {**DEFAULT_SETTINGS, "SOLVER_OUTPUT": 0}
+    SETTINGS = {**DEFAULT_SETTINGS, "ACCOUNTING_PB_EUR_PER_KWH": 0.10,
+                "SOLVER_OUTPUT": 0}
     main(SETTINGS)

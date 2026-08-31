@@ -16,6 +16,18 @@ import numpy as np
 import pandas as pd
 import simbench as sb
 
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "legend.fontsize": 8,
+    "figure.titlesize": 14,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "savefig.facecolor": "white",
+})
 
 T, DT = 96, 0.25
 PHASE3_CODE_VERSION = "2026-08-16-v3-dst-safe"
@@ -96,6 +108,16 @@ def output_folders() -> tuple[Path, Path]:
     csv_folder.mkdir(parents=True, exist_ok=True)
     figure_folder.mkdir(parents=True, exist_ok=True)
     return csv_folder, figure_folder
+
+
+def scenario_figure_folder(scenario: str, style: str | None = None) -> Path:
+    """Return figures/s1[/line|bar] and create it when needed."""
+    _, figure_root = output_folders()
+    folder = figure_root / str(scenario).strip().lower()
+    if style is not None:
+        folder = folder / str(style).strip().lower()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def experiment_dates(settings: dict) -> pd.DatetimeIndex:
@@ -394,6 +416,19 @@ def day_frame(date, loads, pv, result, pa=None, pb=None) -> pd.DataFrame:
     if pb is not None:
         data["pb_eur_per_kwh"] = clean(pb)
         data["total_buy_price_eur_per_kwh"] = clean(np.asarray(pa) + np.asarray(pb))
+    if pa is not None and pb is not None:
+        buy_price = np.asarray(pa, dtype=float) + np.asarray(pb, dtype=float)
+        for bus in BUS_ORDER:
+            key = bus.lower().replace(" ", "_")
+            item = result[bus]
+            sell_price = np.asarray(item.get("sell_price", pa), dtype=float)
+            purchase = buy_price * np.asarray(item["import"], dtype=float) * DT
+            revenue = sell_price * np.asarray(item["export"], dtype=float) * DT
+            data[f"{key}_buy_price_eur_per_kwh"] = clean(buy_price)
+            data[f"{key}_sell_price_eur_per_kwh"] = clean(sell_price)
+            data[f"{key}_purchase_cost_eur"] = clean(purchase)
+            data[f"{key}_sales_revenue_eur"] = clean(revenue)
+            data[f"{key}_net_cost_eur"] = clean(purchase - revenue)
     return pd.DataFrame(data)
 
 
@@ -430,6 +465,25 @@ def day_metrics(scenario: str, date, frame: pd.DataFrame,
         row["purchase_cost_eur"] = purchase
         row["sales_revenue_eur"] = revenue
         row["net_electricity_cost_eur"] = purchase - revenue
+    for bus in BUS_ORDER:
+        key = bus.lower().replace(" ", "_")
+        item = result[bus]
+        bus_import = float(np.sum(item["import"]) * DT)
+        bus_export = float(np.sum(item["export"]) * DT)
+        row[f"{key}_import_energy_kwh"] = bus_import
+        row[f"{key}_export_energy_kwh"] = bus_export
+        if pa is not None and pb is not None:
+            buy_price = np.asarray(pa, dtype=float) + np.asarray(pb, dtype=float)
+            sell_price = np.asarray(item.get("sell_price", pa), dtype=float)
+            bus_purchase = float(np.dot(buy_price, item["import"]) * DT)
+            bus_revenue = float(np.dot(sell_price, item["export"]) * DT)
+            row[f"{key}_purchase_cost_eur"] = bus_purchase
+            row[f"{key}_sales_revenue_eur"] = bus_revenue
+            row[f"{key}_net_cost_eur"] = bus_purchase - bus_revenue
+            row[f"{key}_average_buy_price_eur_per_kwh"] = (
+                bus_purchase / bus_import if bus_import > 1e-9 else 0.0)
+            row[f"{key}_average_sell_price_eur_per_kwh"] = (
+                bus_revenue / bus_export if bus_export > 1e-9 else 0.0)
     return row
 
 
@@ -443,79 +497,205 @@ def save_month(scenario: str, frames: list[pd.DataFrame],
     return timeseries_path, metrics_path
 
 
-def plot_month(scenario: str, title: str, frame: pd.DataFrame,
-               metrics: pd.DataFrame, show_price: bool) -> Path:
-    _, figure_folder = output_folders()
-    time_days = np.arange(len(frame)) * DT / 24.0
-    fig, axes = plt.subplots(4, 2, figsize=(17, 15), sharex=False)
+PLOT_COLORS = {
+    "load": "#505050", "net": "#245A8D", "bess": "#6A4C93",
+    "ev": "#008C95", "pv": "#3A7D44", "import": "#2868A9",
+    "export": "#B23A48", "pa": "#245A8D", "pb": "#A64B2A",
+    "total_price": "#2F6B3C",
+}
 
-    axes[0, 0].plot(time_days, frame["aggregate_baseline_net_kw"], "--",
-                    color="#8C8C8C", lw=0.9, label="Baseline (load - PV)")
-    axes[0, 0].plot(time_days, frame["aggregate_net_kw"],
-                    color="#4C78A8", lw=1.0, label="Net exchange")
-    axes[0, 0].set_title("Monthly aggregate net exchange")
-    axes[0, 0].set_ylabel("kW")
-    axes[0, 0].legend()
 
-    if show_price and "pa_eur_per_kwh" in frame:
-        axes[0, 1].plot(time_days, frame["pa_eur_per_kwh"],
-                        color="#4C78A8", lw=0.9, label="PA")
-        if "pb_eur_per_kwh" in frame:
-            axes[0, 1].plot(time_days, frame["pb_eur_per_kwh"],
-                            color="#F2A65A", lw=0.9, label="PB")
-            axes[0, 1].plot(time_days, frame["total_buy_price_eur_per_kwh"],
-                            color="#72A98F", lw=0.9, label="PA + PB")
-        axes[0, 1].set_title("Monthly common prices")
-        axes[0, 1].set_ylabel("EUR/kWh")
-        axes[0, 1].legend(ncol=3)
+def _power_plot(axis, x, values, style, color, label, *, dashed=False, alpha=1.0):
+    """Draw either a conventional line or one bar for every 15-minute value."""
+    values = np.asarray(values, dtype=float)
+    if style == "bar":
+        axis.bar(x, values, width=DT / 24.0 * 0.90, color=color,
+                 edgecolor="none", alpha=0.82 * alpha, label=label)
     else:
-        axes[0, 1].plot(time_days, frame["aggregate_pv_kw"],
-                        color="#72A98F", lw=1.0, label="Aggregate PV")
-        axes[0, 1].set_title("Monthly aggregate PV")
-        axes[0, 1].set_ylabel("kW")
-        axes[0, 1].legend()
+        axis.plot(x, values, linestyle="--" if dashed else "-", color=color,
+                  lw=1.00 if not dashed else 0.85, alpha=alpha, label=label)
 
-    for index, bus in enumerate(BUS_ORDER):
-        axis = axes[1 + index // 2, index % 2]
-        key = bus.lower().replace(" ", "_")
-        baseline = frame[f"{key}_load_kw"] - frame[f"{key}_pv_kw"]
-        axis.plot(time_days, baseline, "--", color="#9A9A9A", lw=0.7,
-                  label="Baseline")
-        axis.plot(time_days, frame[f"{key}_net_kw"], color=COLORS[bus],
-                  lw=0.9, label="Net")
-        axis.set_title(f"{bus} ({SIMBENCH_MAPPING[bus]['name']})")
-        axis.set_ylabel("kW")
-        axis.legend()
 
-    dates = pd.to_datetime(metrics["date"])
-    axes[3, 0].plot(dates, metrics["baseline_peak_valley_kw"], "--",
-                    color="#8C8C8C", marker="o", ms=3, label="Baseline range")
-    axes[3, 0].plot(dates, metrics["peak_valley_kw"], color="#4C78A8",
-                    marker="o", ms=3, label="Controlled range")
-    axes[3, 0].set_title("Daily peak-valley range")
-    axes[3, 0].set_ylabel("kW")
-    axes[3, 0].legend()
+def _finish_axis(axis, title, ylabel="kW", zero=False):
+    axis.set_title(title, loc="left", fontweight="normal")
+    axis.set_ylabel(ylabel)
+    axis.grid(axis="y", color="#D8D8D8", alpha=0.55, linewidth=0.55)
+    if zero:
+        axis.axhline(0.0, color="#6F6F6F", lw=0.65)
+    axis.margins(y=0.12)
 
-    axes[3, 1].plot(dates, metrics["import_energy_kwh"], color="#F2A65A",
-                    marker="o", ms=3, label="Import")
-    axes[3, 1].plot(dates, metrics["export_energy_kwh"], color="#D98282",
-                    marker="o", ms=3, label="Export")
-    axes[3, 1].set_title("Daily imported and exported energy")
-    axes[3, 1].set_ylabel("kWh")
-    axes[3, 1].legend()
 
-    for axis in axes.flat:
-        axis.grid(alpha=0.22)
-        if axis in axes[:3, :].flat:
-            axis.set_xlabel("Day of experiment")
-        else:
-            axis.tick_params(axis="x", rotation=25)
-    fig.suptitle(title, fontsize=15)
-    fig.tight_layout(rect=(0, 0, 1, 0.975))
-    path = figure_folder / f"{scenario}_monthly_overview.png"
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+def _empty_device_axis(axis, title, message):
+    _finish_axis(axis, title)
+    axis.text(0.5, 0.5, message, transform=axis.transAxes,
+              ha="center", va="center", color="#666666")
+    axis.set_yticks([])
+
+
+def _economic_values(frame, key):
+    imported = float(frame[f"{key}_import_kw"].sum() * DT)
+    exported = float(frame[f"{key}_export_kw"].sum() * DT)
+    purchase_col = f"{key}_purchase_cost_eur"
+    if purchase_col not in frame:
+        return [imported, exported, np.nan, np.nan, np.nan, np.nan, np.nan]
+    purchase = float(frame[purchase_col].sum())
+    revenue = float(frame[f"{key}_sales_revenue_eur"].sum())
+    return [imported, exported, purchase, revenue, purchase - revenue,
+            purchase / imported if imported > 1e-9 else 0.0,
+            revenue / exported if exported > 1e-9 else 0.0]
+
+
+def _add_economic_table(axis, values):
+    axis.axis("off")
+    headers = ["Import\n[kWh]", "Export\n[kWh]", "Purchase\n[EUR]",
+               "Revenue\n[EUR]", "Net cost\n[EUR]", "Avg buy\n[EUR/kWh]",
+               "Avg sell\n[EUR/kWh]"]
+    text = [["-" if not np.isfinite(value) else f"{value:.1f}" for value in values]]
+    table = axis.table(cellText=text, colLabels=headers, cellLoc="center",
+                       colLoc="center", loc="center", bbox=[0.01, 0.05, 0.98, 0.88])
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    for (row, _), cell in table.get_celld().items():
+        cell.set_edgecolor("#B8B8B8")
+        cell.set_linewidth(0.6)
+        cell.set_facecolor("#EAF1F7" if row == 0 else "white")
+
+
+def _plot_price(axis, x, frame, style):
+    if "pa_eur_per_kwh" not in frame:
+        _empty_device_axis(axis, "Electricity prices", "No price data")
+        return
+    # Prices remain lines in both figure editions.  Overlaying three price
+    # columns would hide PA/PB and would not improve interval readability.
+    _power_plot(axis, x, frame["pa_eur_per_kwh"], "line",
+                PLOT_COLORS["pa"], "PA")
+    if "pb_eur_per_kwh" in frame:
+        _power_plot(axis, x, frame["pb_eur_per_kwh"], "line",
+                    PLOT_COLORS["pb"], "PB", alpha=0.85)
+        _power_plot(axis, x, frame["total_buy_price_eur_per_kwh"], "line",
+                    PLOT_COLORS["total_price"], "PA + PB", alpha=0.75)
+    _finish_axis(axis, "Electricity prices", "EUR/kWh")
+    axis.legend(ncol=3, frameon=False)
+
+
+def _plot_bus_figure(scenario, bus_number, bus, frame, x, style, folder):
+    key = bus.lower().replace(" ", "_")
+    fig = plt.figure(figsize=(14, 17))
+    grid = fig.add_gridspec(7, 1, height_ratios=[1.5, 1, 1, 1, 1, 1, 0.72],
+                            hspace=0.34)
+    axes = [fig.add_subplot(grid[index, 0]) for index in range(6)]
+    table_axis = fig.add_subplot(grid[6, 0])
+
+    _power_plot(axes[0], x, frame[f"{key}_load_kw"], "line",
+                PLOT_COLORS["load"], "SimBench load", dashed=True)
+    _power_plot(axes[0], x, frame[f"{key}_net_kw"], style,
+                PLOT_COLORS["net"], "Total net load (all devices)")
+    _finish_axis(axes[0], "Load and total net exchange", zero=True)
+    axes[0].legend(ncol=2, frameon=False)
+
+    _power_plot(axes[1], x, frame[f"{key}_bess_kw"], style,
+                PLOT_COLORS["bess"], "BESS power")
+    _finish_axis(axes[1], "BESS power (+ charge, - discharge)", zero=True)
+    axes[1].legend(frameon=False)
+
+    ev = frame[f"{key}_ev_kw"].to_numpy(float)
+    if "ev_kwh" in BUS_CONFIG[bus]:
+        _power_plot(axes[2], x, ev, style, PLOT_COLORS["ev"], "EV power")
+        _finish_axis(axes[2], "EV power (+ charge, - discharge)", zero=True)
+        axes[2].legend(frameon=False)
+    else:
+        _empty_device_axis(axes[2], "EV power", "No EV on this Bus")
+
+    pv = frame[f"{key}_pv_kw"].to_numpy(float)
+    if np.max(np.abs(pv)) > 1e-9:
+        _power_plot(axes[3], x, pv, style, PLOT_COLORS["pv"], "PV generation")
+        _finish_axis(axes[3], "PV generation")
+        axes[3].legend(frameon=False)
+    else:
+        _empty_device_axis(axes[3], "PV generation", "No PV on this Bus")
+
+    _power_plot(axes[4], x, frame[f"{key}_import_kw"], style,
+                PLOT_COLORS["import"], "Import (+)")
+    _power_plot(axes[4], x, -frame[f"{key}_export_kw"], style,
+                PLOT_COLORS["export"], "Export (-)", alpha=0.88)
+    _finish_axis(axes[4], "Grid transactions", zero=True)
+    axes[4].legend(ncol=2, frameon=False)
+
+    _plot_price(axes[5], x, frame, style)
+    axes[5].set_xlabel("Day of July 2026")
+    _add_economic_table(table_axis, _economic_values(frame, key))
+
+    for axis in axes[:-1]:
+        axis.tick_params(labelbottom=False)
+    cfg = BUS_CONFIG[bus]
+    fig.suptitle(
+        f"{scenario.upper()} | {bus} ({SIMBENCH_MAPPING[bus]['name']}) | "
+        f"BESS {cfg['bess_kwh']:.1f} kWh / {cfg['bess_kw']:.1f} kW",
+        y=0.995,
+    )
+    path = folder / f"{scenario}_bus{bus_number}.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_overview(scenario, title, frame, x, style, folder):
+    fig, axes = plt.subplots(6, 1, figsize=(15, 15), sharex=True)
+    _power_plot(axes[0], x, frame["aggregate_load_kw"], "line",
+                PLOT_COLORS["load"], "SimBench load", dashed=True)
+    _power_plot(axes[0], x, frame["aggregate_net_kw"], style,
+                PLOT_COLORS["net"], "Aggregate total net load")
+    _finish_axis(axes[0], "Aggregate load and net exchange", zero=True)
+    axes[0].legend(ncol=2, frameon=False)
+
+    aggregate_bess = sum(frame[f"{b.lower().replace(' ', '_')}_bess_kw"]
+                         for b in BUS_ORDER)
+    aggregate_ev = sum(frame[f"{b.lower().replace(' ', '_')}_ev_kw"]
+                       for b in BUS_ORDER)
+    aggregate_import = sum(frame[f"{b.lower().replace(' ', '_')}_import_kw"]
+                           for b in BUS_ORDER)
+    aggregate_export = sum(frame[f"{b.lower().replace(' ', '_')}_export_kw"]
+                           for b in BUS_ORDER)
+    for axis, values, color, axis_title, legend in (
+        (axes[1], aggregate_bess, PLOT_COLORS["bess"],
+         "Aggregate BESS power (+ charge, - discharge)", "BESS"),
+        (axes[2], aggregate_ev, PLOT_COLORS["ev"],
+         "Aggregate EV power (+ charge, - discharge)", "EV"),
+        (axes[3], frame["aggregate_pv_kw"], PLOT_COLORS["pv"],
+         "Aggregate PV generation", "PV"),
+    ):
+        _power_plot(axis, x, values, style, color, legend)
+        _finish_axis(axis, axis_title, zero="discharge" in axis_title)
+        axis.legend(frameon=False)
+    _power_plot(axes[4], x, aggregate_import, style,
+                PLOT_COLORS["import"], "Import (+)")
+    _power_plot(axes[4], x, -aggregate_export, style,
+                PLOT_COLORS["export"], "Export (-)")
+    _finish_axis(axes[4], "Aggregate grid transactions", zero=True)
+    axes[4].legend(ncol=2, frameon=False)
+    _plot_price(axes[5], x, frame, style)
+    axes[5].set_xlabel("Day of July 2026")
+    fig.suptitle(f"{title} — {style.capitalize()} view", y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.982))
+    path = folder / f"{scenario}_overview.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+def plot_month(scenario: str, title: str, frame: pd.DataFrame,
+               metrics: pd.DataFrame, show_price: bool) -> Path:
+    """Create both readable line figures and 15-minute column figures."""
+    del metrics, show_price  # all needed information is already in the timeseries
+    x = np.arange(len(frame)) * DT / 24.0
+    returned_path = None
+    for style in ("line", "bar"):
+        folder = scenario_figure_folder(scenario, style)
+        overview_path = _plot_overview(scenario, title, frame, x, style, folder)
+        for bus_number, bus in enumerate(BUS_ORDER, 1):
+            _plot_bus_figure(scenario, bus_number, bus, frame, x, style, folder)
+        if style == "line":
+            returned_path = overview_path
+    return returned_path
 
 
 DEFAULT_SETTINGS = {
@@ -525,7 +705,7 @@ DEFAULT_SETTINGS = {
     "START_DATE": "2026-07-01",
     "END_DATE": "2026-07-31",
     # Use an integer such as 2 for a quick test; None runs all 31 days.
-    "MAX_DAYS": 3,
+    "MAX_DAYS": 2,
     "PA_FILE": "pa_de_lu_seq1_2026.csv",
     "PA_TIME_COLUMN": "MTU (CET/CEST)",
     "PA_SEQUENCE_COLUMN": "Sequence",

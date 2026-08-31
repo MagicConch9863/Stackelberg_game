@@ -5,7 +5,7 @@ import pandas as pd
 from p3_common import (
     BUS_CONFIG, BUS_ORDER, DEFAULT_SETTINGS, DT, T, day_frame, day_inputs,
     day_metrics, experiment_dates, load_fixed_simbench_day, plot_month,
-    read_pv_month, save_month, trip_vector,
+    read_pa_month, read_pv_month, save_month, select_export_price, trip_vector,
 )
 
 
@@ -35,10 +35,13 @@ def predefined_dispatch(bus):
 
 def main(settings):
     loads = load_fixed_simbench_day(settings)
+    pa_month = read_pa_month(settings)
     pv_month = read_pv_month(settings)
     frames, metrics = [], []
     for number, date in enumerate(experiment_dates(settings), 1):
-        _, pv, _ = day_inputs(date, loads, None, pv_month, settings)
+        _, pv, pa = day_inputs(date, loads, pa_month, pv_month, settings)
+        pb = np.full(T, settings["ACCOUNTING_PB_EUR_PER_KWH"])
+        sell_price = select_export_price(pa, pb, settings["EXPORT_PRICE_MODE"])
         result = {}
         for bus in BUS_ORDER:
             cfg = BUS_CONFIG[bus]
@@ -49,23 +52,25 @@ def main(settings):
                 "import": np.maximum(net, 0.0),
                 "export": np.maximum(-net, 0.0),
                 "bess_energy": energy(bess, cfg["bess_e_init"]),
+                "sell_price": sell_price,
             }
             if "ev_kwh" in cfg:
                 item["ev_energy"] = energy(
                     ev, 0.6 * cfg["ev_kwh"], trip_vector(bus))
             result[bus] = item
-        frame = day_frame(date, loads, pv, result)
+        frame = day_frame(date, loads, pv, result, pa, pb)
         frames.append(frame)
-        metrics.append(day_metrics("s1", date, frame, result))
+        metrics.append(day_metrics("s1", date, frame, result, pa, pb))
         print(f"S1 {number:02d}: {date.date()} complete")
 
     ts_path, metric_path = save_month("s1", frames, metrics)
     month_frame = pd.concat(frames, ignore_index=True)
     metric_frame = pd.DataFrame(metrics)
     figure = plot_month("s1", "Phase 3 S1: predefined operation",
-                        month_frame, metric_frame, show_price=False)
+                        month_frame, metric_frame, show_price=True)
     print(f"Timeseries: {ts_path}\nMetrics: {metric_path}\nFigure: {figure}")
 
 
 if __name__ == "__main__":
-    main(DEFAULT_SETTINGS.copy())
+    SETTINGS = {**DEFAULT_SETTINGS, "ACCOUNTING_PB_EUR_PER_KWH": 0.10}
+    main(SETTINGS)
