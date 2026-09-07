@@ -5,14 +5,19 @@ import numpy as np
 import pandas as pd
 import simbench as sb
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 INPUT = ROOT / "input_data"
 RESULTS = ROOT / "results"
 DATA_RESULTS = RESULTS / "data"
-DIRECT_ARX_RESULTS = RESULTS / "direct_arx"
-GAUSSIAN_NOISE_RESULTS = RESULTS / "gaussian_noise"
-CORRELATED_GAUSSIAN_RESULTS = RESULTS / "correlated_gaussian"
-RANDOM_WALK_RESULTS = RESULTS / "random_walk"
+FORECAST_MODEL_RESULTS = RESULTS / "forecast_model_tests"
+NOISE_MECHANISM_RESULTS = RESULTS / "noise_mechanism_tests"
+CONTROL_INPUT_RESULTS = RESULTS / "control_inputs"
+CONTROL_EXPERIMENT_RESULTS = RESULTS / "control_experiments"
+
+DIRECT_ARX_RESULTS = FORECAST_MODEL_RESULTS / "direct_arx"
+GAUSSIAN_NOISE_RESULTS = NOISE_MECHANISM_RESULTS / "iid_gaussian"
+CORRELATED_GAUSSIAN_RESULTS = NOISE_MECHANISM_RESULTS / "correlated_gaussian"
+RANDOM_WALK_RESULTS = NOISE_MECHANISM_RESULTS / "random_walk"
 
 for output_dir in (
     DATA_RESULTS,
@@ -20,6 +25,8 @@ for output_dir in (
     GAUSSIAN_NOISE_RESULTS,
     CORRELATED_GAUSSIAN_RESULTS,
     RANDOM_WALK_RESULTS,
+    CONTROL_INPUT_RESULTS,
+    CONTROL_EXPERIMENT_RESULTS,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 

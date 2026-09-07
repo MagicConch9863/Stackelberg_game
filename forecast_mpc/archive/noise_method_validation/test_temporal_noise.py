@@ -1,9 +1,14 @@
 import random
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from forecast_common import (
     CORRELATED_GAUSSIAN_RESULTS,
@@ -21,7 +26,9 @@ DAY_SEED = 20250831
 NOISE_SEED = 20250902
 
 AR1_RHOS = (0.5, 0.9, 0.99)
-INNOVATION_SIGMA_KW = 0.3
+AR1_SIGMA_EPSILON_KW = 0.3
+RANDOM_WALK_LOAD_SIGMA_EPSILON_KW = 0.45
+RANDOM_WALK_PV_SIGMA_EPSILON_KW = 0.3
 PV_MAX_KW = 5.5
 PV_ACTIVE_THRESHOLD_KW = 0.01
 
@@ -46,7 +53,6 @@ def configure_plot_style():
         "axes.facecolor": "white",
         "axes.spines.top": False,
         "axes.spines.right": False,
-        "pdf.fonttype": 42,
     })
 
 
@@ -116,11 +122,9 @@ def save_grid(records, variable, label, scenario_label, output_dir, file_stem):
                         wspace=0.20, hspace=0.34)
 
     png_path = output_dir / f"{file_stem}_{variable}_24h_16days_4x4.png"
-    pdf_path = output_dir / f"{file_stem}_{variable}_24h_16days_4x4.pdf"
     fig.savefig(png_path, dpi=300, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
-    return png_path, pdf_path
+    return png_path
 
 
 def build_base_records(data, days, models):
@@ -147,9 +151,23 @@ def run_scenario(base_records, name, rho, stationary, output_dir, seed):
     plot_records = {"load": [], "pv": []}
 
     for kind in ("load", "pv"):
+        sigma_epsilon = (
+            AR1_SIGMA_EPSILON_KW
+            if stationary
+            else (
+                RANDOM_WALK_LOAD_SIGMA_EPSILON_KW
+                if kind == "load"
+                else RANDOM_WALK_PV_SIGMA_EPSILON_KW
+            )
+        )
+        print(
+            f"    Generating {kind.upper()} paths "
+            f"(rho={rho:.2f}, sigma_epsilon={sigma_epsilon:.2f} kW)...",
+            flush=True,
+        )
         for record in base_records[kind]:
             error, innovations = temporal_error(
-                HORIZON, rho, INNOVATION_SIGMA_KW, rng, stationary
+                HORIZON, rho, sigma_epsilon, rng, stationary
             )
             noisy, raw, active, lower_clip, upper_clip = apply_physical_constraints(
                 record["base"], error, kind
@@ -161,7 +179,7 @@ def run_scenario(base_records, name, rho, stationary, output_dir, seed):
             metric_rows.append({
                 "scenario": name,
                 "rho": rho,
-                "sigma_epsilon_kW": INNOVATION_SIGMA_KW,
+                "sigma_epsilon_kW": sigma_epsilon,
                 "date": record["day"].date(),
                 "variable": kind,
                 "base_MAE_kW": base_mae,
@@ -183,7 +201,7 @@ def run_scenario(base_records, name, rho, stationary, output_dir, seed):
                 lower_clip, upper_clip,
             ):
                 forecast_rows.append([
-                    name, rho, INNOVATION_SIGMA_KW, record["day"].date(), kind,
+                    name, rho, sigma_epsilon, record["day"].date(), kind,
                     *values,
                 ])
 
@@ -202,13 +220,23 @@ def run_scenario(base_records, name, rho, stationary, output_dir, seed):
     forecasts.to_csv(output_dir / "forecasts.csv", index=False)
     summary.to_csv(output_dir / "summary.csv", index=False)
 
-    scenario_label = (
-        f"AR(1), rho={rho:.2f}, sigma_epsilon={INNOVATION_SIGMA_KW:.2f} kW"
-        if stationary else
-        f"Random walk, rho=1.00, sigma_epsilon={INNOVATION_SIGMA_KW:.2f} kW"
-    )
     stem = "correlated" if stationary else "random_walk"
     for kind, label in (("load", "Load"), ("pv", "PV")):
+        sigma_epsilon = (
+            AR1_SIGMA_EPSILON_KW
+            if stationary
+            else (
+                RANDOM_WALK_LOAD_SIGMA_EPSILON_KW
+                if kind == "load"
+                else RANDOM_WALK_PV_SIGMA_EPSILON_KW
+            )
+        )
+        scenario_label = (
+            f"AR(1), rho={rho:.2f}, sigma_epsilon={sigma_epsilon:.2f} kW"
+            if stationary else
+            f"Random walk, rho=1.00, sigma_epsilon={sigma_epsilon:.2f} kW"
+        )
+        print(f"    Saving {label} figure...", flush=True)
         save_grid(plot_records[kind], kind, label, scenario_label, output_dir, stem)
 
     return metrics, summary
@@ -244,13 +272,12 @@ def save_comparison(all_metrics, output_dir):
     fig.suptitle("Temporal-error scenario comparison", fontsize=13)
     fig.tight_layout()
     fig.savefig(output_dir / "rmse_comparison.png", dpi=300, bbox_inches="tight")
-    fig.savefig(output_dir / "rmse_comparison.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
 def main():
     configure_plot_style()
-    print("Reading data and training 24h Direct ARX models...")
+    print("[1/7] Building the SimBench/SMARD dataset...", flush=True)
     data = dataset()
     train = data[data.index.year == TRAIN_YEAR]
     test = data[data.index.year == TEST_YEAR]
@@ -258,34 +285,38 @@ def main():
     if len(complete_days) < N_DAYS:
         raise RuntimeError(f"Only {len(complete_days)} complete test days found.")
     days = sorted(random.Random(DAY_SEED).sample(complete_days, N_DAYS))
-    models = {
-        "load": DirectARX(HORIZON, "load").fit(train["load_kw"]),
-        "pv": DirectARX(HORIZON, "pv").fit(train["pv_kw"]),
-    }
+    print("[2/7] Training the 96-step Load Direct ARX model...", flush=True)
+    load_model = DirectARX(HORIZON, "load").fit(train["load_kw"])
+    print("[3/7] Training the 96-step PV Direct ARX model...", flush=True)
+    pv_model = DirectARX(HORIZON, "pv").fit(train["pv_kw"])
+    models = {"load": load_model, "pv": pv_model}
+    print("[4/7] Building the common 16-day base forecasts...", flush=True)
     base_records = build_base_records(data, days, models)
 
     all_metrics = []
+    print("[5/7] Running the stationary AR(1) scenarios...", flush=True)
     for index, rho in enumerate(AR1_RHOS):
         output_dir = CORRELATED_GAUSSIAN_RESULTS / f"rho_{rho:.2f}"
-        print(f"Running stationary AR(1), rho={rho:.2f}...")
+        print(f"  AR(1) rho={rho:.2f}", flush=True)
         metrics, _ = run_scenario(
             base_records, "ar1", rho, True, output_dir, NOISE_SEED + index
         )
         all_metrics.append(metrics)
 
-    print("Running unrestricted random walk, rho=1.00...")
+    print("[6/7] Running the unrestricted Random walk scenario...", flush=True)
     metrics, _ = run_scenario(
         base_records, "random_walk", 1.0, False,
         RANDOM_WALK_RESULTS / "rho_1.00", NOISE_SEED + len(AR1_RHOS),
     )
     all_metrics.append(metrics)
+    print("[7/7] Saving comparisons and validating physical constraints...", flush=True)
     save_comparison(all_metrics, CORRELATED_GAUSSIAN_RESULTS / "comparison")
 
     combined = pd.concat(all_metrics, ignore_index=True)
     violations = int(combined["inactive_PV_violation_count"].sum())
     if violations:
         raise RuntimeError(f"Detected {violations} inactive-period PV violations.")
-    print("All scenarios completed; inactive-period PV violations: 0")
+    print("Completed: inactive-period PV violations = 0", flush=True)
 
 
 if __name__ == "__main__":
