@@ -112,7 +112,10 @@ def _terminal_reachable_bounds(bus, end_step, boundary_step=None):
     )
 
 
-def _follower_lp(bus, baseline, current_energy, origin_step, day_steps=STEPS_PER_DAY):
+def _follower_lp(
+    bus, baseline, current_energy, origin_step, day_steps=STEPS_PER_DAY,
+    enforce_daily_terminal=True, terminal_soc_band=None,
+):
     baseline = np.asarray(baseline, dtype=float)
     horizon = len(baseline)
     cfg = BUS_CONFIG[bus]
@@ -139,18 +142,20 @@ def _follower_lp(bus, baseline, current_energy, origin_step, day_steps=STEPS_PER
     # Enforce the daily SOC band whenever a midnight boundary lies inside the
     # rolling horizon. SOC remains continuous; it is never reset at midnight.
     first_boundary = ((int(origin_step) // day_steps) + 1) * day_steps
-    for boundary in range(first_boundary, end_step + 1, day_steps):
-        count = boundary - int(origin_step)
-        boundary_row = np.zeros(q)
-        boundary_row[:count] = DT
-        aub.extend((boundary_row, -boundary_row))
-        bub.extend((target_high - current_energy, current_energy - target_low))
+    if enforce_daily_terminal:
+        for boundary in range(first_boundary, end_step + 1, day_steps):
+            count = boundary - int(origin_step)
+            boundary_row = np.zeros(q)
+            boundary_row[:count] = DT
+            aub.extend((boundary_row, -boundary_row))
+            bub.extend((target_high - current_energy, current_energy - target_low))
 
     # Before the next midnight enters the horizon, retain only the necessary
     # reachability band so the daily target cannot become physically impossible.
     next_boundary = ((end_step + day_steps - 1) // day_steps) * day_steps
-    if next_boundary == end_step:
-        # Already enforced above; retain these values for diagnostics only.
+    if not enforce_daily_terminal:
+        reachable_low, reachable_high = cfg["bess_e_min"], cfg["bess_e_max"]
+    elif next_boundary == end_step:
         reachable_low, reachable_high = target_low, target_high
     else:
         reachable_low, reachable_high, _, _ = _terminal_reachable_bounds(
@@ -166,6 +171,23 @@ def _follower_lp(bus, baseline, current_energy, origin_step, day_steps=STEPS_PER
         if reachable_low > cfg["bess_e_min"] + 1e-10:
             aub.append(-row.copy())
             bub.append(current_energy - reachable_low)
+
+    # Optional long-timescale energy guidance. This constrains only the end of
+    # the rolling window; all within-window BESS actions remain free.
+    if terminal_soc_band is not None and end_step % day_steps != 0:
+        reference_low, reference_high = map(float, terminal_soc_band)
+        physical_low = max(cfg["bess_e_min"], current_energy - horizon * DT * cfg["bess_kw"])
+        physical_high = min(cfg["bess_e_max"], current_energy + horizon * DT * cfg["bess_kw"])
+        reference_low = max(reference_low, physical_low)
+        reference_high = min(reference_high, physical_high)
+        if reference_low > reference_high:
+            center = 0.5 * sum(map(float, terminal_soc_band))
+            projected = min(max(center, physical_low), physical_high)
+            reference_low = reference_high = projected
+        reference_row = np.zeros(q)
+        reference_row[:horizon] = DT
+        aub.extend((reference_row, -reference_row))
+        bub.extend((reference_high - current_energy, current_energy - reference_low))
 
     # At an optimum import and export cannot both be positive because PB >= 0
     # and epsilon > 0. These per-period bounds are therefore exact, not heuristic.
@@ -193,8 +215,15 @@ def _complementarity(model, slack_expression, slack_max, dual, name, dual_max):
     model.addConstr(dual <= dual_max * (1.0 - binary))
 
 
-def _add_follower_kkt(model, bus, baseline, current_energy, pa, pb, origin_step):
-    packed = _follower_lp(bus, baseline, current_energy, origin_step)
+def _add_follower_kkt(
+    model, bus, baseline, current_energy, pa, pb, origin_step,
+    enforce_daily_terminal=True, terminal_soc_band=None,
+):
+    packed = _follower_lp(
+        bus, baseline, current_energy, origin_step,
+        enforce_daily_terminal=enforce_daily_terminal,
+        terminal_soc_band=terminal_soc_band,
+    )
     aeq, beq, aub, bub, lb, ub = packed[:6]
     horizon = len(baseline)
     q = 3 * horizon
@@ -270,7 +299,8 @@ def _add_follower_kkt(model, bus, baseline, current_energy, pa, pb, origin_step)
 
 def _solve_stackelberg_window(
     date, origin, forecasts, energies, pa, previous_pb, current_hour_pb,
-    warm_pb=None, mip_gap=None, time_limit_s=None,
+    warm_pb=None, mip_gap=None, time_limit_s=None, enforce_daily_terminal=True,
+    terminal_soc_bands=None, previous_realized_net=None,
 ):
     horizon = len(pa)
     model = gp.Model(f"T5_T6_{date:%Y%m%d}_{origin:02d}")
@@ -285,6 +315,13 @@ def _solve_stackelberg_window(
         TIME_LIMIT_S_PER_UPDATE if time_limit_s is None else time_limit_s
     )
     model.Params.NumericFocus = 1
+    # OL helper routines set several Gurobi parameters globally. Explicitly
+    # restore MPC-local values so a preceding day-ahead solve cannot add a
+    # 60-second NoRel heuristic phase to every rolling update.
+    model.Params.Heuristics = 0.05
+    model.Params.NoRelHeurTime = 0.0
+    model.Params.PumpPasses = -1
+    model.Params.RINS = -1
     # The trivial nonnegative peak-to-valley bound is often weak. Prioritize
     # bound improvement and exact MILP cuts rather than additional heuristics.
     model.Params.MIPFocus = 3
@@ -315,11 +352,19 @@ def _solve_stackelberg_window(
     for bus in BUS_ORDER:
         baseline = forecasts["load"][bus] - forecasts["pv"][bus]
         x[bus], bounds[bus], bounded_duals[bus], dual_bounds[bus] = _add_follower_kkt(
-            model, bus, baseline, energies[bus], pa, pb, origin
+            model, bus, baseline, energies[bus], pa, pb, origin,
+            enforce_daily_terminal=enforce_daily_terminal,
+            terminal_soc_band=(None if terminal_soc_bands is None else terminal_soc_bands[bus]),
         )
 
     peak = model.addVar(lb=-GRB.INFINITY, name="peak")
     valley = model.addVar(lb=-GRB.INFINITY, name="valley")
+    if previous_realized_net is not None:
+        # Include the last measured aggregate exchange in the range without
+        # imposing a hard ramp. A discontinuity remains feasible, but it is no
+        # longer invisible to the receding-horizon leader objective.
+        model.addConstr(peak >= float(previous_realized_net), name="anchor_peak")
+        model.addConstr(valley <= float(previous_realized_net), name="anchor_valley")
     for step in range(horizon):
         aggregate = gp.quicksum(
             x[bus][horizon + step] - x[bus][2 * horizon + step] for bus in BUS_ORDER
