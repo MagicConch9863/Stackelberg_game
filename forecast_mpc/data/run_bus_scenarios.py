@@ -33,7 +33,7 @@ from p4_common import (  # noqa: E402
 from p4_run import SETTINGS as PHASE4_SETTINGS  # noqa: E402
 
 
-DATES = (pd.Timestamp("2025-01-15"), pd.Timestamp("2025-07-15"))
+DATES = (pd.Timestamp("2025-01-15"), pd.Timestamp("2025-01-16"))
 BASE_SEED = 20250903
 SIGMA_EPSILON_KW = 0.3
 AR1_RHO = 0.9

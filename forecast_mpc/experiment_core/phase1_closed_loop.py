@@ -30,6 +30,8 @@ BASE_SEED = 20250903
 SIGMA_EPSILON_KW = 0.3
 AR1_RHO = 0.9
 PV_ACTIVE_THRESHOLD_KW = 0.01
+INITIAL_MPC_TIME_LIMIT_S = 1200.0
+ROLLING_MPC_TIME_LIMIT_S = 900.0
 
 EXPERIMENTS = {
     "t5_perfect": ("perfect", ROOT / "t5_perfect_mpc_mpc" / "results_online_2days"),
@@ -198,10 +200,9 @@ def run(name):
     started = time.time()
     for origin in range(start_origin, SIM_STEPS):
         forecast = _forecast(actual, scenario, origin)
-        # The first two updates receive extra time, but a 180 s ceiling avoids
-        # spending many minutes proving a weak KKT-MILP bound after the
-        # incumbent has stopped improving. Later updates retain the 600 s cap.
-        limit = 180.0 if origin < 2 else 600.0
+        # Cold-start updates need more time on slower machines. Later updates
+        # benefit from the shifted tariff warm start but retain a generous cap.
+        limit = INITIAL_MPC_TIME_LIMIT_S if origin < 2 else ROLLING_MPC_TIME_LIMIT_S
         print(f"\n[{name}] MPC {origin + 1:03d}/{SIM_STEPS} | {timestamps[origin]} | limit={limit:.0f}s", flush=True)
         solution = _solve_stackelberg_window(
             timestamps[origin], origin, forecast, energy, pa[origin:origin + HORIZON],

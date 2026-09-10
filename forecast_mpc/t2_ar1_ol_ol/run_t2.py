@@ -7,4 +7,6 @@ if str(ROOT) not in sys.path:
 
 from experiment_core.ol_experiment import run_experiment
 
-run_experiment("t2")
+
+if __name__ == "__main__":
+    run_experiment("t2")
