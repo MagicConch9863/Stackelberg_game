@@ -10,6 +10,12 @@ import pandas as pd
 
 SCENARIOS = ("s1", "s2", "s3", "s4")
 SOFT_COLORS = ("#A9A9A9", "#8ECAE6", "#FFB4A2", "#A8D5BA")
+GERMAN_TITLES = {
+    "s1": "S1 – Unkoordinierter Referenzfall",
+    "s2": "S2 – Preisbasierter Betrieb",
+    "s3": "S3 – Stackelberg-Koordination",
+    "s4": "S4 – Direkte zentrale Steuerung",
+}
 
 
 def load_frames(csv_folder):
@@ -46,22 +52,20 @@ def main():
     figure_folder.mkdir(exist_ok=True)
     frames = load_frames(csv_folder)
     fig, axes = plt.subplots(2, 2, figsize=(15, 9), sharex=True, sharey=True)
+    s1_reference = frames["s1"]["aggregate_net_kw"].to_numpy(float)
     for axis, scenario in zip(axes.flat, SCENARIOS):
         frame = frames[scenario]
-        baseline_column = ("aggregate_baseline_net_kw"
-                           if "aggregate_baseline_net_kw" in frame
-                           else "aggregate_load_kw")
-        axis.plot(frame["time_h"], frame[baseline_column], "--",
-                  color="0.5", lw=1.8, label="Baseline (load - PV)")
+        axis.plot(frame["time_h"], s1_reference, "--",
+                  color="0.55", lw=2.2, label="S1-Referenz")
         axis.plot(frame["time_h"], frame["aggregate_net_kw"],
-                  color="tab:blue", lw=1.8, label="Net exchange")
-        axis.set_title(scenario.upper())
-        axis.set_xlabel("Time [h]"); axis.set_ylabel("kW")
+                  color="#1769AA", lw=2.8, label="Netzaustausch")
+        axis.set_title(GERMAN_TITLES[scenario])
+        axis.set_xlabel("Zeit [h]"); axis.set_ylabel("Leistung [kW]")
         axis.grid(alpha=.25); axis.legend()
-    fig.suptitle("C-B: effect of S1-S4 on the same SimBench load and PV", fontsize=15)
+    fig.suptitle("C–B: Vergleich von S1 bis S4 bei identischen Last- und PV-Daten", fontsize=15)
     fig.tight_layout(rect=(0, 0, 1, .96))
     output = figure_folder/"scenario_comparison_2x2.png"
-    fig.savefig(output, dpi=180, bbox_inches="tight")
+    fig.savefig(output, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     metrics = performance_metrics(frames)

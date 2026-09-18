@@ -12,8 +12,34 @@ outputs/
 *.bmp
 *.tiff
 *.csv
+*.npz
+*terminal.log
+*.tex
+*.pdf
+*.bib
 
 # 忽略所有名为 figures 的文件夹及其内容
 **/figures/
 **/results/
 **/csv_results/
+**/presentation/
+**/archive/
+**/analysis/
+# Codex / local preview cache
+.codex_preview/
+
+# Runtime logs
+*.log
+
+# Solver checkpoints and resumable runtime state
+**/checkpoint/
+*.npz
+**/day_ahead_cache_meta.json
+
+# LaTeX intermediate files
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk

@@ -7,7 +7,7 @@ import simbench as sb
 
 ROOT = Path(__file__).resolve().parents[2]
 INPUT = ROOT / "input_data"
-RESULTS = ROOT / "results"
+RESULTS = ROOT / "noise_and_arx_validation" / "results"
 DATA_RESULTS = RESULTS / "data"
 FORECAST_MODEL_RESULTS = RESULTS / "forecast_model_tests"
 NOISE_MECHANISM_RESULTS = RESULTS / "noise_mechanism_tests"
