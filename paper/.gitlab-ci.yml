@@ -1,0 +1,35 @@
+image: gitlab.iaew.rwth-aachen.de:4567/iaew/docker/texlive:latest
+
+before_script:
+  - git submodule sync --recursive
+  - git submodule update --init --recursive
+  
+main_eng:
+  stage: build
+  tags:
+    - docker
+  script:
+    - pdflatex -shell-escape -synctex=1 -interaction=batchmode "\newcommand\varLanguage{english}\input{main.tex}"
+    - biber main
+    - pdflatex -shell-escape -synctex=1 -interaction=batchmode "\newcommand\varLanguage{english}\input{main.tex}"
+    - pdflatex -shell-escape -synctex=1 -interaction=nonstopmode -file-line-error "\newcommand\varLanguage{english}\input{main.tex}"
+  artifacts:
+    paths:
+      - main.pdf
+      - ./*.log
+    when: always
+
+main_de:
+  stage: build
+  tags:
+    - docker
+  script:
+    - pdflatex -shell-escape -synctex=1 -interaction=batchmode main.tex
+    - biber main
+    - pdflatex -shell-escape -synctex=1 -interaction=batchmode main.tex
+    - pdflatex -shell-escape -synctex=1 -interaction=nonstopmode -file-line-error main.tex
+  artifacts:
+    paths:
+      - main.pdf
+      - ./*.log
+    when: always

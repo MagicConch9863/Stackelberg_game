@@ -330,7 +330,7 @@ def _add_follower_kkt(
 def _solve_stackelberg_window(
     date, origin, forecasts, energies, pa, previous_pb, current_hour_pb,
     warm_pb=None, mip_gap=None, time_limit_s=None, enforce_daily_terminal=True,
-    terminal_soc_bands=None, previous_realized_net=None,
+    terminal_soc_bands=None, previous_realized_net=None, feasibility_focus=False,
 ):
     horizon = len(pa)
     model = gp.Model(f"T5_T6_{date:%Y%m%d}_{origin:02d}")
@@ -348,14 +348,14 @@ def _solve_stackelberg_window(
     # OL helper routines set several Gurobi parameters globally. Explicitly
     # restore MPC-local values so a preceding day-ahead solve cannot add a
     # 60-second NoRel heuristic phase to every rolling update.
-    model.Params.Heuristics = 0.05
-    model.Params.NoRelHeurTime = 0.0
-    model.Params.PumpPasses = -1
-    model.Params.RINS = -1
-    # The trivial nonnegative peak-to-valley bound is often weak. Prioritize
-    # bound improvement and exact MILP cuts rather than additional heuristics.
-    model.Params.MIPFocus = 3
-    model.Params.Cuts = 3
+    model.Params.Heuristics = 0.50 if feasibility_focus else 0.05
+    model.Params.NoRelHeurTime = 60.0 if feasibility_focus else 0.0
+    model.Params.PumpPasses = 10 if feasibility_focus else -1
+    model.Params.RINS = 10 if feasibility_focus else -1
+    # Full-day OL models prioritize finding an incumbent. Rolling MPC models
+    # prioritize bound improvement once their shifted warm start is available.
+    model.Params.MIPFocus = 1 if feasibility_focus else 3
+    model.Params.Cuts = -1 if feasibility_focus else 3
     model.Params.Presolve = 2
     model.Params.Symmetry = 2
     model.Params.Seed = 1

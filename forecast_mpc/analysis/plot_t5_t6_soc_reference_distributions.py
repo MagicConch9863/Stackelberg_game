@@ -118,9 +118,6 @@ def _draw_metric(ax: plt.Axes, frame: pd.DataFrame, metric: str, title: str) -> 
         patch.set_edgecolor(COLORS[method])
         patch.set_linewidth(1.0)
 
-    # The dates are paired observations, so connect each T5/T6 daily pair.
-    for left, right in zip(values[0], values[1]):
-        ax.plot(positions, (left, right), color="0.72", lw=0.65, alpha=0.65, zorder=1)
     for position, method, method_values in zip(positions, METHODS, values):
         ax.scatter(
             np.full(len(method_values), position), method_values,
@@ -194,7 +191,7 @@ def _plot(frame: pd.DataFrame, duration: str) -> Path:
         _draw_metric(ax, frame, metric, title)
     fig.suptitle(
         f"T5-IID vs T6-AR(1): daily performance distributions\n"
-        f"Continuous {duration} experiment | paired daily observations, n = {n_days}",
+        f"Continuous {duration} experiment | daily observations, n = {n_days}",
         y=0.975,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.925])

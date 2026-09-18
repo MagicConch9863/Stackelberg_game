@@ -16,8 +16,14 @@ outputs/
 *.json
 *.npz
 *terminal.log
+*.tex
+*.pdf
+*.bib
 
 # 忽略所有名为 figures 的文件夹及其内容
 **/figures/
 **/results/
 **/csv_results/
+**/presentation/
+**/archive/
+**/analysis/
