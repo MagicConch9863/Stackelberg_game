@@ -112,6 +112,7 @@ def add_follower_kkt(model, bus, load, pa, pb, settings):
 
 
 def main(settings):
+    raise RuntimeError("Legacy terminal-SOC model. Use phase4 soft_soc_20_80_v1.")
     csv_folder, figure_folder = output_folders()
     loads, pv, pa = load_inputs(settings, need_price=True)
     m = gp.Model("CB_S3_one_leader_four_followers")

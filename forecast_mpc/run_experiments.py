@@ -10,15 +10,15 @@ import sys
 ROOT = Path(__file__).resolve().parent
 
 EXPERIMENTS = {
-    "t1": (ROOT / "t1_iid_ol_ol" / "run_t1.py", ROOT / "t1_iid_ol_ol" / "results"),
-    "t2": (ROOT / "t2_ar1_ol_ol" / "run_t2.py", ROOT / "t2_ar1_ol_ol" / "results"),
-    "t3": (ROOT / "t3_iid_ol_mpc" / "run_t3.py", ROOT / "t3_iid_ol_mpc" / "results_online_2days"),
-    "t4": (ROOT / "t4_ar1_ol_mpc" / "run_t4.py", ROOT / "t4_ar1_ol_mpc" / "results_online_2days"),
-    "t5": (ROOT / "t5_iid_mpc_mpc" / "run_t5.py", ROOT / "t5_iid_mpc_mpc" / "results_10days_soc_reference"),
-    "t6": (ROOT / "t6_ar1_mpc_mpc" / "run_t6.py", ROOT / "t6_ar1_mpc_mpc" / "results_10days_soc_reference"),
+    "t1": (ROOT / "t1_iid_ol_ol" / "run_t1.py", ROOT / "t1_iid_ol_ol" / "results_soft_soc"),
+    "t2": (ROOT / "t2_ar1_ol_ol" / "run_t2.py", ROOT / "t2_ar1_ol_ol" / "results_soft_soc"),
+    "t3": (ROOT / "t3_iid_ol_mpc" / "run_t3.py", ROOT / "t3_iid_ol_mpc" / "results_soft_soc_3days"),
+    "t4": (ROOT / "t4_ar1_ol_mpc" / "run_t4.py", ROOT / "t4_ar1_ol_mpc" / "results_soft_soc_3days"),
+    "t5": (ROOT / "t5_iid_mpc_mpc" / "run_t5.py", ROOT / "t5_iid_mpc_mpc" / "results_soft_soc"),
+    "t6": (ROOT / "t6_ar1_mpc_mpc" / "run_t6.py", ROOT / "t6_ar1_mpc_mpc" / "results_soft_soc"),
     "t5_perfect": (
         ROOT / "t5_perfect_mpc_mpc" / "run_t5_perfect.py",
-        ROOT / "t5_perfect_mpc_mpc" / "results_online_2days",
+        ROOT / "t5_perfect_mpc_mpc" / "results_soft_soc",
     ),
 }
 

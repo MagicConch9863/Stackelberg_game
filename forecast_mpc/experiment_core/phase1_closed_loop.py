@@ -25,16 +25,16 @@ if str(PHASE4) not in sys.path:
 from p4_common import day_inputs, load_simbench_profiles, read_pa_year, read_pv_source
 
 START_DATE = pd.Timestamp("2025-01-15")
-SIM_STEPS = 2 * 96
+SIM_STEPS = 3 * 96
 BASE_SEED = 20250903
 SIGMA_EPSILON_KW = 0.3
 AR1_RHO = 0.9
 PV_ACTIVE_THRESHOLD_KW = 0.01
 
 EXPERIMENTS = {
-    "t5_perfect": ("perfect", ROOT / "t5_perfect_mpc_mpc" / "results_online_2days"),
-    "t5": ("iid", ROOT / "t5_iid_mpc_mpc" / "results_online_2days"),
-    "t6": ("ar1", ROOT / "t6_ar1_mpc_mpc" / "results_online_2days"),
+    "t5_perfect": ("perfect", ROOT / "t5_perfect_mpc_mpc" / "results_soft_soc_3days"),
+    "t5": ("iid", ROOT / "t5_iid_mpc_mpc" / "results_soft_soc_3days"),
+    "t6": ("ar1", ROOT / "t6_ar1_mpc_mpc" / "results_soft_soc_3days"),
 }
 
 
@@ -96,7 +96,9 @@ def _forecast(realization, scenario, origin, horizon=HORIZON):
 
 def _metrics(name, frame):
     rows = []
-    groups = [("full_48h", frame)] + [(str(d.date()), g) for d, g in frame.groupby(frame.timestamp.dt.normalize())]
+    groups = [(f"full_{SIM_STEPS * DT:g}h", frame)] + [
+        (str(d.date()), g) for d, g in frame.groupby(frame.timestamp.dt.normalize())
+    ]
     for period, data in groups:
         net = data.realized_net_kw.to_numpy()
         base = data.uncontrolled_net_kw.to_numpy()
@@ -135,14 +137,14 @@ def _plot(name, frame, plans, output):
     for ax in axes.flat:
         ax.set_xlabel("Time (h)")
         ax.grid(True, ls="--", alpha=0.3, lw=0.5)
-        ax.set_xlim(0, 48)
+        ax.set_xlim(0, SIM_STEPS * DT)
     axes[0, 0].set_ylabel("Power (kW)")
     axes[0, 1].set_ylabel("Net load (kW)")
     axes[1, 0].set_ylabel("Power (kW)")
     axes[1, 1].set_ylabel("PB (EUR/kWh)")
     fig.suptitle(f"{name}: 48 h strict rolling Stackelberg MPC", fontsize=13)
     fig.tight_layout()
-    fig.savefig(output / "stackelberg_mpc_overview_2days.png", dpi=300, bbox_inches="tight")
+    fig.savefig(output / "stackelberg_mpc_overview_3days.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 

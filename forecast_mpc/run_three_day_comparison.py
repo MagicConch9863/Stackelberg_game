@@ -10,10 +10,8 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from experiment_core.three_day_comparison import OUTPUT_ROOT, run_method
-
-
 METHODS = ("t1", "t2", "t3", "t4", "t5_perfect")
+OUTPUT_ROOT = ROOT / "comparison_3days"
 OUTPUT_NAMES = {
     "t1": "t1_iid_ol_ol",
     "t2": "t2_ar1_ol_ol",
@@ -39,6 +37,10 @@ class Tee:
 
 
 def main():
+    raise RuntimeError(
+        "This legacy comparison runner is invalid after the soft-SOC redesign. "
+        "Rebuild T1-T6 with results_soft_soc instead."
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment", choices=("all", *METHODS), default="all")
     args = parser.parse_args()

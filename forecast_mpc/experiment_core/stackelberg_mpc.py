@@ -20,18 +20,20 @@ if str(PHASE4) not in sys.path:
 
 from p4_common import BUS_CONFIG, BUS_ORDER, DT, daily_metrics, make_result_item, read_pa_year
 from p4_run import SETTINGS as PHASE4_SETTINGS
+from soc_soft_band import soc_limits
 
 
 SCENARIO_FILE = ROOT / "results" / "control_inputs" / "bus_scenarios" / "forecast_scenarios.csv"
 STEPS_PER_DAY = 96
 HORIZON = 16
 TIME_LIMIT_S_PER_UPDATE = 600.0
+FORMULATION_VERSION = "soft_soc_20_80_v1"
 
 EXPERIMENTS = {
     "t5_perfect": {
         "label": "T5 diagnostic: perfect forecast + tariff MPC + BESS MPC",
         "scenario": "perfect",
-        "output": ROOT / "t5_perfect_mpc_mpc" / "results",
+        "output": ROOT / "t5_perfect_mpc_mpc" / "results_soft_soc",
         "dates": ("2025-01-15",),
         "mip_gap": 0.05,
         "time_limit_s": 600.0,
@@ -39,7 +41,7 @@ EXPERIMENTS = {
     "t5": {
         "label": "T5 IID Gaussian: tariff MPC + BESS MPC",
         "scenario": "iid",
-        "output": ROOT / "t5_iid_mpc_mpc" / "results",
+        "output": ROOT / "t5_iid_mpc_mpc" / "results_soft_soc",
         "dates": ("2025-01-15",),
         "mip_gap": 0.05,
         "time_limit_s": 600.0,
@@ -49,7 +51,7 @@ EXPERIMENTS = {
     "t6": {
         "label": "T6 AR(1) Gaussian: tariff MPC + BESS MPC",
         "scenario": "ar1",
-        "output": ROOT / "t6_ar1_mpc_mpc" / "results",
+        "output": ROOT / "t6_ar1_mpc_mpc" / "results_soft_soc",
         "dates": ("2025-01-15",),
         "mip_gap": 0.05,
         "time_limit_s": 600.0,
@@ -94,32 +96,12 @@ def _forecast_window(data, scenario, origin, stop):
     return forecast
 
 
-def _terminal_reachable_bounds(bus, end_step, boundary_step=None):
-    cfg = BUS_CONFIG[bus]
-    tolerance = PHASE4_SETTINGS["TERMINAL_ENERGY_TOL_FRAC"] * (
-        cfg["bess_e_max"] - cfg["bess_e_min"]
-    )
-    target_low = max(cfg["bess_e_min"], cfg["bess_e_init"] - tolerance)
-    target_high = min(cfg["bess_e_max"], cfg["bess_e_init"] + tolerance)
-    if boundary_step is None:
-        boundary_step = STEPS_PER_DAY
-    remaining_energy = max(0, int(boundary_step) - int(end_step)) * DT * cfg["bess_kw"]
-    return (
-        max(cfg["bess_e_min"], target_low - remaining_energy),
-        min(cfg["bess_e_max"], target_high + remaining_energy),
-        target_low,
-        target_high,
-    )
-
-
-def _follower_lp(
-    bus, baseline, current_energy, origin_step, day_steps=STEPS_PER_DAY,
-    enforce_daily_terminal=True, terminal_soc_band=None,
-):
+def _follower_lp(bus, baseline, current_energy, origin_step):
     baseline = np.asarray(baseline, dtype=float)
     horizon = len(baseline)
     cfg = BUS_CONFIG[bus]
-    q = 3 * horizon
+    # [BESS, import, export, SOC-under-slack, SOC-over-slack]
+    q = 5 * horizon
     aeq, beq, aub, bub = [], [], [], []
 
     # -BESS + import - export = baseline, i.e. import-export=load-PV+BESS.
@@ -137,72 +119,38 @@ def _follower_lp(
         aub.extend((row, -row))
         bub.extend((cfg["bess_e_max"] - current_energy, current_energy - cfg["bess_e_min"]))
 
-    end_step = int(origin_step) + horizon
-    _, _, target_low, target_high = _terminal_reachable_bounds(bus, end_step)
-    # Enforce the daily SOC band whenever a midnight boundary lies inside the
-    # rolling horizon. SOC remains continuous; it is never reset at midnight.
-    first_boundary = ((int(origin_step) // day_steps) + 1) * day_steps
-    if enforce_daily_terminal:
-        for boundary in range(first_boundary, end_step + 1, day_steps):
-            count = boundary - int(origin_step)
-            boundary_row = np.zeros(q)
-            boundary_row[:count] = DT
-            aub.extend((boundary_row, -boundary_row))
-            bub.extend((target_high - current_energy, current_energy - target_low))
+    physical_low, physical_high, soft_low, soft_high = soc_limits(cfg, PHASE4_SETTINGS)
+    # The soft band is identical at every step; no date, terminal target or
+    # midnight boundary appears in the formulation.
+    for count in range(1, horizon + 1):
+        low_row = np.zeros(q)
+        low_row[:count] = -DT
+        low_row[3 * horizon + count - 1] = -1.0
+        aub.append(low_row)
+        bub.append(current_energy - soft_low)
 
-    # Before the next midnight enters the horizon, retain only the necessary
-    # reachability band so the daily target cannot become physically impossible.
-    next_boundary = ((end_step + day_steps - 1) // day_steps) * day_steps
-    if not enforce_daily_terminal:
-        reachable_low, reachable_high = cfg["bess_e_min"], cfg["bess_e_max"]
-    elif next_boundary == end_step:
-        reachable_low, reachable_high = target_low, target_high
-    else:
-        reachable_low, reachable_high, _, _ = _terminal_reachable_bounds(
-            bus, end_step, next_boundary
-        )
-        # Add only bounds stricter than the ordinary horizon-end SOC bounds.
-        # At midnight the exact band above already exists; do not duplicate it.
-        row = np.zeros(q)
-        row[:horizon] = DT
-        if reachable_high < cfg["bess_e_max"] - 1e-10:
-            aub.append(row.copy())
-            bub.append(reachable_high - current_energy)
-        if reachable_low > cfg["bess_e_min"] + 1e-10:
-            aub.append(-row.copy())
-            bub.append(current_energy - reachable_low)
-
-    # Optional long-timescale energy guidance. This constrains only the end of
-    # the rolling window; all within-window BESS actions remain free.
-    if terminal_soc_band is not None and end_step % day_steps != 0:
-        reference_low, reference_high = map(float, terminal_soc_band)
-        physical_low = max(cfg["bess_e_min"], current_energy - horizon * DT * cfg["bess_kw"])
-        physical_high = min(cfg["bess_e_max"], current_energy + horizon * DT * cfg["bess_kw"])
-        reference_low = max(reference_low, physical_low)
-        reference_high = min(reference_high, physical_high)
-        if reference_low > reference_high:
-            center = 0.5 * sum(map(float, terminal_soc_band))
-            projected = min(max(center, physical_low), physical_high)
-            reference_low = reference_high = projected
-        reference_row = np.zeros(q)
-        reference_row[:horizon] = DT
-        aub.extend((reference_row, -reference_row))
-        bub.extend((reference_high - current_energy, current_energy - reference_low))
+        high_row = np.zeros(q)
+        high_row[:count] = DT
+        high_row[4 * horizon + count - 1] = -1.0
+        aub.append(high_row)
+        bub.append(soft_high - current_energy)
 
     # At an optimum import and export cannot both be positive because PB >= 0
     # and epsilon > 0. These per-period bounds are therefore exact, not heuristic.
     bess_limit = float(cfg["bess_kw"])
     import_ub = np.maximum(baseline + bess_limit, 0.0)
     export_ub = np.maximum(-baseline + bess_limit, 0.0)
-    lb = np.r_[np.full(horizon, -cfg["bess_kw"]), np.zeros(2 * horizon)]
+    lb = np.r_[np.full(horizon, -cfg["bess_kw"]), np.zeros(4 * horizon)]
     ub = np.r_[
         np.full(horizon, cfg["bess_kw"]),
         import_ub,
         export_ub,
+        np.full(horizon, soft_low - physical_low),
+        np.full(horizon, physical_high - soft_high),
     ]
     return (
         np.asarray(aeq), np.asarray(beq), np.asarray(aub), np.asarray(bub), lb, ub,
-        reachable_low, reachable_high, target_low, target_high,
+        physical_low, physical_high, soft_low, soft_high,
     )
 
 
@@ -217,22 +165,23 @@ def _complementarity(model, slack_expression, slack_max, dual, name, dual_max):
 
 def _add_follower_kkt(
     model, bus, baseline, current_energy, pa, pb, origin_step,
-    enforce_daily_terminal=True, terminal_soc_band=None,
 ):
     packed = _follower_lp(
         bus, baseline, current_energy, origin_step,
-        enforce_daily_terminal=enforce_daily_terminal,
-        terminal_soc_band=terminal_soc_band,
     )
     aeq, beq, aub, bub, lb, ub = packed[:6]
     horizon = len(baseline)
-    q = 3 * horizon
+    q = 5 * horizon
     tag = bus.replace(" ", "_")
     epsilon = float(PHASE4_SETTINGS["FLOW_TIE_BREAK_EUR_PER_KWH"])
     max_marginal_cost = DT * max(
         np.max(np.abs(-np.asarray(pa) + epsilon)),
         np.max(np.abs(np.asarray(pa) + PHASE4_SETTINGS["PB_MIN"] + epsilon)),
         np.max(np.abs(np.asarray(pa) + PHASE4_SETTINGS["PB_MAX"] + epsilon)),
+    )
+    max_marginal_cost = max(
+        max_marginal_cost,
+        float(PHASE4_SETTINGS["SOC_SOFT_PENALTY_EUR_PER_KWH"]),
     )
     min_dynamic_coefficient = min(DT, 1.0)
     derived_dual_bound = 1.0 + horizon * max_marginal_cost / min_dynamic_coefficient
@@ -281,9 +230,11 @@ def _add_follower_kkt(
         elif j < 2 * horizon:
             step = j - horizon
             cost = DT * (pa[step] + pb[step] + epsilon)
-        else:
+        elif j < 3 * horizon:
             step = j - 2 * horizon
             cost = DT * (-pa[step] + epsilon)
+        else:
+            cost = float(PHASE4_SETTINGS["SOC_SOFT_PENALTY_EUR_PER_KWH"])
         equality_terms = gp.quicksum(aeq[i, j] * lam[i] for i in np.flatnonzero(aeq[:, j]))
         inequality_terms = gp.quicksum(aub[i, j] * mu[i] for i in np.flatnonzero(aub[:, j]))
         if lower_dual[j] is not None:
@@ -299,8 +250,7 @@ def _add_follower_kkt(
 
 def _solve_stackelberg_window(
     date, origin, forecasts, energies, pa, previous_pb, current_hour_pb,
-    warm_pb=None, mip_gap=None, time_limit_s=None, enforce_daily_terminal=True,
-    terminal_soc_bands=None, previous_realized_net=None,
+    warm_pb=None, mip_gap=None, time_limit_s=None, previous_realized_net=None,
 ):
     horizon = len(pa)
     model = gp.Model(f"T5_T6_{date:%Y%m%d}_{origin:02d}")
@@ -353,8 +303,6 @@ def _solve_stackelberg_window(
         baseline = forecasts["load"][bus] - forecasts["pv"][bus]
         x[bus], bounds[bus], bounded_duals[bus], dual_bounds[bus] = _add_follower_kkt(
             model, bus, baseline, energies[bus], pa, pb, origin,
-            enforce_daily_terminal=enforce_daily_terminal,
-            terminal_soc_band=(None if terminal_soc_bands is None else terminal_soc_bands[bus]),
         )
 
     peak = model.addVar(lb=-GRB.INFINITY, name="peak")
@@ -431,7 +379,8 @@ def _simulate_day(config, date, data, pa_day, output):
     checkpoint_dir, state_path, meta_path, solver_path, forecast_path = _checkpoint_paths(output, date)
     if state_path.exists() and meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        expected = {"label": config["label"], "scenario": scenario, "horizon": HORIZON}
+        expected = {"label": config["label"], "scenario": scenario, "horizon": HORIZON,
+                    "formulation_version": FORMULATION_VERSION}
         if all(meta.get(key) == value for key, value in expected.items()):
             state = np.load(state_path)
             start_origin = int(state["origin_next"])
@@ -521,7 +470,8 @@ def _simulate_day(config, date, data, pa_day, output):
             **{f"energy_{index}": energy_paths[bus] for index, bus in enumerate(BUS_ORDER)},
         )
         meta_path.write_text(
-            json.dumps({"label": config["label"], "scenario": scenario, "horizon": HORIZON}, indent=2),
+            json.dumps({"label": config["label"], "scenario": scenario, "horizon": HORIZON,
+                        "formulation_version": FORMULATION_VERSION}, indent=2),
             encoding="utf-8",
         )
         pd.DataFrame(solver_rows).to_csv(solver_path, index=False)

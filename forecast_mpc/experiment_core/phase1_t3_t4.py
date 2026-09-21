@@ -23,19 +23,14 @@ PHASE4 = PROJECT_ROOT / "stackelberg_scenario_analysis" / "phase4"
 if str(PHASE4) not in sys.path:
     sys.path.insert(0, str(PHASE4))
 from p4_s3_stackelberg import solve_day as solve_stackelberg_day
+from soc_soft_band import add_soft_soc_band
 
 ROOT = Path(__file__).resolve().parents[1]
 FLOW_TIE_BREAK = float(PHASE4_SETTINGS["FLOW_TIE_BREAK_EUR_PER_KWH"])
 EXPERIMENTS = {
-    "t3": ("iid", ROOT / "t3_iid_ol_mpc" / "results_online_2days"),
-    "t4": ("ar1", ROOT / "t4_ar1_ol_mpc" / "results_online_2days"),
+    "t3": ("iid", ROOT / "t3_iid_ol_mpc" / "results_soft_soc_3days"),
+    "t4": ("ar1", ROOT / "t4_ar1_ol_mpc" / "results_soft_soc_3days"),
 }
-
-
-def _soc_targets(bus):
-    cfg = BUS_CONFIG[bus]
-    tol = PHASE4_SETTINGS["TERMINAL_ENERGY_TOL_FRAC"] * (cfg["bess_e_max"] - cfg["bess_e_min"])
-    return max(cfg["bess_e_min"], cfg["bess_e_init"] - tol), min(cfg["bess_e_max"], cfg["bess_e_init"] + tol)
 
 
 def _solve_follower(bus, current_energy, baseline, pa, pb, origin):
@@ -52,20 +47,12 @@ def _solve_follower(bus, current_energy, baseline, pa, pb, origin):
     for j in range(h):
         model.addConstr(imp[j] - exp[j] == baseline[j] + bess[j])
         model.addConstr(energy[j + 1] == energy[j] + DT * bess[j])
-    end = origin + h
-    target_low, target_high = _soc_targets(bus)
-    first_boundary = ((origin // 96) + 1) * 96
-    for boundary in range(first_boundary, end + 1, 96):
-        j = boundary - origin
-        model.addConstr(energy[j] >= target_low)
-        model.addConstr(energy[j] <= target_high)
-    next_boundary = ((end + 95) // 96) * 96
-    if next_boundary != end:
-        possible = (next_boundary - end) * DT * cfg["bess_kw"]
-        model.addConstr(energy[h] >= max(cfg["bess_e_min"], target_low - possible))
-        model.addConstr(energy[h] <= min(cfg["bess_e_max"], target_high + possible))
-    model.setObjective(gp.quicksum(DT * ((pa[j] + pb[j] + FLOW_TIE_BREAK) * imp[j]
-                              + (-pa[j] + FLOW_TIE_BREAK) * exp[j]) for j in range(h)), GRB.MINIMIZE)
+    soc_penalty, _, _ = add_soft_soc_band(
+        model, energy, h, cfg, PHASE4_SETTINGS, bus.replace(" ", "_")
+    )
+    energy_cost = gp.quicksum(DT * ((pa[j] + pb[j] + FLOW_TIE_BREAK) * imp[j]
+                              + (-pa[j] + FLOW_TIE_BREAK) * exp[j]) for j in range(h))
+    model.setObjective(energy_cost + soc_penalty, GRB.MINIMIZE)
     started = time.perf_counter()
     model.optimize()
     if model.Status != GRB.OPTIMAL:
@@ -77,8 +64,8 @@ def _day_ahead_pb(name, scenario, output, actual, pa, timestamps):
     path = output / "fixed_pb_plans.csv"
     if path.exists():
         saved = pd.read_csv(path)
-        if len(saved) == SIM_STEPS + 96:
-            print(f"[{name}] Reusing cached PB plans (including forecast buffer day).", flush=True)
+        if len(saved) == SIM_STEPS:
+            print(f"[{name}] Reusing cached three-day PB plans.", flush=True)
             return saved.pb_eur_per_kwh.to_numpy(float), saved
     settings = deepcopy(PHASE4_SETTINGS)
     settings.update({"SOLVER_OUTPUT": 1, "TIME_LIMIT_S_PER_DAY": 1200, "MIP_GAP": 0.05})
@@ -118,11 +105,11 @@ def _plot(name, frame, forecasts, output):
     axes[1, 1].step(x, frame.pb_eur_per_kwh, where="post", color="#CC79A7", lw=1)
     axes[1, 1].set_title("Fixed day-ahead PB")
     for ax in axes.flat:
-        ax.set_xlabel("Time (h)"); ax.grid(True, ls="--", alpha=.3, lw=.5); ax.set_xlim(0,48)
+        ax.set_xlabel("Time (h)"); ax.grid(True, ls="--", alpha=.3, lw=.5); ax.set_xlim(0,SIM_STEPS*DT)
     axes[0,0].set_ylabel("Power (kW)"); axes[0,1].set_ylabel("Net load (kW)")
     axes[1,0].set_ylabel("Power (kW)"); axes[1,1].set_ylabel("PB (EUR/kWh)")
     fig.suptitle(f"{name.upper()}: fixed OL tariff + 4 h rolling BESS MPC", fontsize=13)
-    fig.tight_layout(); fig.savefig(output / "mpc_overview_2days.png", dpi=300, bbox_inches="tight"); plt.close(fig)
+    fig.tight_layout(); fig.savefig(output / "mpc_overview_3days.png", dpi=300, bbox_inches="tight"); plt.close(fig)
 
 
 def run(name):

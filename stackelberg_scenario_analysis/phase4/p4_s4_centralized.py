@@ -3,6 +3,7 @@ from gurobipy import GRB
 import numpy as np
 
 from p4_common import BUS_CONFIG, BUS_ORDER, DT, T, make_result_item
+from soc_soft_band import add_soft_soc_band
 
 
 def solve_day(date, loads, pv, settings):
@@ -12,6 +13,7 @@ def solve_day(date, loads, pv, settings):
     model.Params.DisplayInterval = int(settings.get("GUROBI_DISPLAY_INTERVAL_S", 2))
 
     bess, eb, net = {}, {}, {}
+    soc_penalties = []
 
     for bus in BUS_ORDER:
         cfg = BUS_CONFIG[bus]
@@ -33,12 +35,6 @@ def solve_day(date, loads, pv, settings):
 
         model.addConstr(eb[bus][0] == cfg["bess_e_init"])
 
-        terminal_tol = settings["TERMINAL_ENERGY_TOL_FRAC"] * (
-            cfg["bess_e_max"] - cfg["bess_e_min"]
-        )
-        model.addConstr(eb[bus][T] - eb[bus][0] <= terminal_tol)
-        model.addConstr(eb[bus][0] - eb[bus][T] <= terminal_tol)
-
         for t in range(T):
             model.addConstr(
                 eb[bus][t + 1] == eb[bus][t] + DT * bess[bus][t]
@@ -47,6 +43,8 @@ def solve_day(date, loads, pv, settings):
                 net[bus][t]
                 == loads[bus][t] - pv[bus][t] + bess[bus][t]
             )
+        penalty, _, _ = add_soft_soc_band(model, eb[bus], T, cfg, settings, tag)
+        soc_penalties.append(penalty)
 
     peak = model.addVar(lb=-GRB.INFINITY, name="peak")
     valley = model.addVar(lb=-GRB.INFINITY, name="valley")
@@ -56,7 +54,7 @@ def solve_day(date, loads, pv, settings):
         model.addConstr(peak >= aggregate)
         model.addConstr(valley <= aggregate)
 
-    model.setObjective(peak - valley, GRB.MINIMIZE)
+    model.setObjective(peak - valley + gp.quicksum(soc_penalties), GRB.MINIMIZE)
     model.update()
     print(
         f"[S4][GUROBI] model for {date.date()}: vars={model.NumVars}, "
