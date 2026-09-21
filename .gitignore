@@ -12,8 +12,6 @@ outputs/
 *.bmp
 *.tiff
 *.csv
-*.log
-*.json
 *.npz
 *terminal.log
 *.tex
@@ -27,3 +25,21 @@ outputs/
 **/presentation/
 **/archive/
 **/analysis/
+# Codex / local preview cache
+.codex_preview/
+
+# Runtime logs
+*.log
+
+# Solver checkpoints and resumable runtime state
+**/checkpoint/
+*.npz
+**/day_ahead_cache_meta.json
+
+# LaTeX intermediate files
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk

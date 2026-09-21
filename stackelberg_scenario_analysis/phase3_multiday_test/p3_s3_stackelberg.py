@@ -201,6 +201,7 @@ def solve_day(date, loads, pv, pa, settings):
 
 
 def main(settings):
+    raise RuntimeError("Legacy terminal-SOC model. Rebuild with phase4 soft_soc_20_80_v1.")
     loads = load_fixed_simbench_day(settings)
     pa_month = read_pa_month(settings)
     pv_month = read_pv_month(settings)

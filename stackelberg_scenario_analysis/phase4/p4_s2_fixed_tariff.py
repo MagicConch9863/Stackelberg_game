@@ -3,6 +3,7 @@ from gurobipy import GRB
 import numpy as np
 
 from p4_common import BUS_CONFIG, BUS_ORDER, DT, T, make_result_item
+from soc_soft_band import add_soft_soc_band
 
 
 def solve_follower(bus, baseline, pa, pb, settings):
@@ -35,18 +36,12 @@ def solve_follower(bus, baseline, pa, pb, settings):
 
     model.addConstr(eb[0] == cfg["bess_e_init"])
 
-    terminal_tol = settings["TERMINAL_ENERGY_TOL_FRAC"] * (
-        cfg["bess_e_max"] - cfg["bess_e_min"]
-    )
-
-    model.addConstr(eb[T] - eb[0] <= terminal_tol)
-    model.addConstr(eb[0] - eb[T] <= terminal_tol)
-
     for t in range(T):
         model.addConstr(eb[t + 1] == eb[t] + DT * bess[t])
         model.addConstr(imp[t] - exp[t] == baseline[t] + bess[t])
 
     eps = float(settings["FLOW_TIE_BREAK_EUR_PER_KWH"])
+    soc_penalty, _, _ = add_soft_soc_band(model, eb, T, cfg, settings, bus.replace(" ", "_"))
 
     model.setObjective(
         gp.quicksum(
@@ -56,7 +51,7 @@ def solve_follower(bus, baseline, pa, pb, settings):
                 + eps * (imp[t] + exp[t])
             )
             for t in range(T)
-        ),
+        ) + soc_penalty,
         GRB.MINIMIZE,
     )
 

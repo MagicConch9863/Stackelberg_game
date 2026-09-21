@@ -3,11 +3,13 @@ from gurobipy import GRB
 import numpy as np
 
 from p4_common import BUS_CONFIG, BUS_ORDER, DT, T, make_result_item
+from soc_soft_band import soc_limits
 
 
 def follower_lp(bus, baseline, settings):
     cfg = BUS_CONFIG[bus]
-    q = 3 * T
+    # [BESS, import, export, SOC-under-slack, SOC-over-slack]
+    q = 5 * T
 
     aeq, beq, aub, bub = [], [], [], []
 
@@ -30,14 +32,21 @@ def follower_lp(bus, baseline, settings):
             cfg["bess_e_init"] - cfg["bess_e_min"],
         ))
 
-    # Terminal-energy tolerance.
-    terminal_tol = settings["TERMINAL_ENERGY_TOL_FRAC"] * (
-        cfg["bess_e_max"] - cfg["bess_e_min"]
-    )
-    row = np.zeros(q)
-    row[:T] = DT
-    aub.extend((row, -row))
-    bub.extend((terminal_tol, terminal_tol))
+    physical_low, physical_high, soft_low, soft_high = soc_limits(cfg, settings)
+    # Time-invariant soft comfort band at every future state:
+    # E_k + v^-_k >= 20% C and E_k - v^+_k <= 80% C.
+    for k in range(1, T + 1):
+        low_row = np.zeros(q)
+        low_row[:k] = -DT
+        low_row[3 * T + k - 1] = -1.0
+        aub.append(low_row)
+        bub.append(cfg["bess_e_init"] - soft_low)
+
+        high_row = np.zeros(q)
+        high_row[:k] = DT
+        high_row[4 * T + k - 1] = -1.0
+        aub.append(high_row)
+        bub.append(soft_high - cfg["bess_e_init"])
 
     grid_bound = float(settings["GRID_BOUND_KW"])
 
@@ -45,11 +54,15 @@ def follower_lp(bus, baseline, settings):
         np.full(T, -cfg["bess_kw"]),
         np.zeros(T),
         np.zeros(T),
+        np.zeros(T),
+        np.zeros(T),
     ]
     ub = np.r_[
         np.full(T, cfg["bess_kw"]),
         np.full(T, grid_bound),
         np.full(T, grid_bound),
+        np.full(T, soft_low - physical_low),
+        np.full(T, physical_high - soft_high),
     ]
 
     return tuple(map(np.asarray, (aeq, beq, aub, bub))) + (lb, ub)
@@ -67,7 +80,7 @@ def complementarity(model, slack_expr, slack_max, dual, name, dual_max):
 
 def add_kkt(model, bus, baseline, pa, pb, settings):
     aeq, beq, aub, bub, lb, ub = follower_lp(bus, baseline, settings)
-    q = 3 * T
+    q = 5 * T
     tag = bus.replace(" ", "_")
 
     x = model.addVars(q, lb=-GRB.INFINITY, name=f"x_{tag}")
@@ -148,9 +161,11 @@ def add_kkt(model, bus, baseline, pa, pb, settings):
         elif j < 2 * T:
             t = j - T
             cost = DT * (pa[t] + pb[t] + eps)
-        else:
+        elif j < 3 * T:
             t = j - 2 * T
             cost = DT * (-pa[t] + eps)
+        else:
+            cost = float(settings["SOC_SOFT_PENALTY_EUR_PER_KWH"])
 
         equality_terms = gp.quicksum(
             aeq[i, j] * lam[i]

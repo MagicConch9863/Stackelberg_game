@@ -9,6 +9,7 @@ from cb_common import (BUS_CONFIG, BUS_ORDER, DEFAULT_SETTINGS, DT, T,
 
 
 def main(settings):
+    raise RuntimeError("Legacy terminal-SOC model. Use phase4 soft_soc_20_80_v1.")
     csv_folder, figure_folder = output_folders()
     loads, pv, _ = load_inputs(settings)
     m = gp.Model("CB_S4_centralized")

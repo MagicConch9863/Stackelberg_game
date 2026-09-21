@@ -116,6 +116,10 @@ def _plot(frame, refs):
 
 
 def run():
+    raise RuntimeError(
+        "Obsolete experiment: the SOC-reference/midnight formulation was removed. "
+        "Use the soft_soc_20_80_v1 experiment entry points instead."
+    )
     OUTPUT.mkdir(parents=True,exist_ok=True)
     print("[T5-perfect SOC reference] Loading data...",flush=True)
     actual,pa,timestamps=_load_data()

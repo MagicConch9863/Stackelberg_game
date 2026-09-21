@@ -16,15 +16,26 @@ from p4_common import PAPER_METRIC_LABELS, figure_folder
 
 
 SCENARIO_ORDER = ("S1", "S2", "S3", "S4")
+SCENARIO_COLORS = {
+    "S1": "#B8BEC5",
+    "S2": "#86B6D8",
+    "S3": "#D9A66F",
+    "S4": "#78A98B",
+}
 
 FIGURE_METRICS = (
-    "export_energy_kwh",
-    "import_energy_kwh",
-    "maximum_ramp_kw_per_15min",
-    "net_electricity_cost_eur",
     "peak_kw",
     "valley_kw",
+    "maximum_ramp_kw_per_15min",
+    "net_electricity_cost_eur",
 )
+
+GERMAN_METRIC_LABELS = {
+    "peak_kw": "Spitzenwert [kW]",
+    "valley_kw": "Talwert [kW]",
+    "maximum_ramp_kw_per_15min": "Maximale Rampe [kW/15 min]",
+    "net_electricity_cost_eur": "Netto-Stromkosten [EUR]",
+}
 
 
 plt.rcParams.update({
@@ -97,27 +108,27 @@ def _draw_boxplot(ax, frame: pd.DataFrame, metric: str):
             "marker": "^",
             "markerfacecolor": "black",
             "markeredgecolor": "black",
-            "markersize": 5,
+            "markersize": 6,
         },
-        medianprops={"color": "black", "linewidth": 1.0},
-        whiskerprops={"color": "black", "linewidth": 0.8},
-        capprops={"color": "black", "linewidth": 0.8},
+        medianprops={"color": "#26323D", "linewidth": 1.8},
+        whiskerprops={"color": "#4D5964", "linewidth": 1.35},
+        capprops={"color": "#4D5964", "linewidth": 1.35},
         flierprops={
             "marker": "o",
             "markerfacecolor": "white",
             "markeredgecolor": "black",
-            "markersize": 4,
+            "markersize": 5,
         },
     )
 
-    gray_levels = ("0.87", "0.76", "0.64", "0.52")
-    for patch, gray in zip(box["boxes"], gray_levels):
-        patch.set_facecolor(gray)
-        patch.set_edgecolor("black")
-        patch.set_linewidth(0.8)
+    for patch, label in zip(box["boxes"], labels):
+        patch.set_facecolor(SCENARIO_COLORS[label])
+        patch.set_alpha(0.72)
+        patch.set_edgecolor("#33404C")
+        patch.set_linewidth(1.35)
 
-    ax.set_title(PAPER_METRIC_LABELS[metric])
-    ax.grid(axis="y", alpha=0.22, linewidth=0.6)
+    ax.set_title(GERMAN_METRIC_LABELS[metric])
+    ax.grid(axis="y", alpha=0.22, linewidth=0.8)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=3)
 
@@ -127,7 +138,7 @@ def plot_experiment_distribution(frame: pd.DataFrame, experiment_name: str):
     if subset.empty:
         return
 
-    fig, axes = plt.subplots(2, 3, figsize=(13.2, 7.8))
+    fig, axes = plt.subplots(2, 2, figsize=(10.4, 7.6))
 
     for ax, metric in zip(axes.flat, FIGURE_METRICS):
         _draw_boxplot(ax, subset, metric)
@@ -136,12 +147,17 @@ def plot_experiment_distribution(frame: pd.DataFrame, experiment_name: str):
     months = sorted(subset["month"].dropna().astype(int).unique().tolist())
 
     fig.suptitle(
-        f"Performance distributions — {experiment_name}\n"
-        f"Months: {months} | sampled day occurrences: {occurrences}",
+        "C–B: Ergebnisverteilungen für repräsentative Tage\n"
+        f"Monate: {months} | ausgewertete Tagesfälle: {occurrences}",
         y=0.995,
     )
 
-    fig.tight_layout(rect=[0, 0, 1, 0.955])
+    fig.text(
+        0.5, 0.015,
+        "S3: indirekte Stackelberg-Koordination   |   S4: direkte zentrale Steuerung (Referenz)",
+        ha="center", fontsize=9.5,
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 0.94])
 
     folder = figure_folder()
     stem = safe_filename(f"distribution_{experiment_name}")

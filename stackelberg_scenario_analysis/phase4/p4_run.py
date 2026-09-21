@@ -30,6 +30,7 @@ from p4_s4_centralized import solve_day as solve_s4
 # ============================================================
 
 SETTINGS = {
+    "FORMULATION_VERSION": "soft_soc_20_80_v1",
     # --------------------------------------------------------
     # Year / external data
     # --------------------------------------------------------
@@ -111,7 +112,11 @@ SETTINGS = {
     # --------------------------------------------------------
     # BESS / S2 / S3
     # --------------------------------------------------------
-    "TERMINAL_ENERGY_TOL_FRAC": 0.05,
+    # SOC is physically constrained to [0%, 100%].  The preferred interval is
+    # soft and time invariant; no terminal/day-ahead SOC reference is used.
+    "SOC_SOFT_MIN_FRAC": 0.20,
+    "SOC_SOFT_MAX_FRAC": 0.80,
+    "SOC_SOFT_PENALTY_EUR_PER_KWH": 1.0,
     "FIXED_PB_EUR_PER_KWH": 0.10,
 
     "PB_MIN": 0.0,
@@ -123,7 +128,7 @@ SETTINGS = {
     "DUAL_BIG_M": 100.0, 
     "MIP_GAP": 0.05,
     "TIME_LIMIT_S_PER_DAY": 1200,
-    "SOLVER_OUTPUT": 1,
+    "SOLVER_OUTPUT": 0,
     "GUROBI_DISPLAY_INTERVAL_S": 2,
     "FLOW_TIE_BREAK_EUR_PER_KWH": 1e-5,
 

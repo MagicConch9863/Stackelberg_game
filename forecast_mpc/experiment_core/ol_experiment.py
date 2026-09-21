@@ -55,17 +55,17 @@ EXPERIMENTS = {
     "reference": {
         "label": "Reference",
         "forecast_column": "forecast_perfect_kW",
-        "output": ROOT / "reference_ol_ol" / "results",
+        "output": ROOT / "reference_ol_ol" / "results_soft_soc",
     },
     "t1": {
         "label": "T1 IID Gaussian",
         "forecast_column": "forecast_iid_kW",
-        "output": ROOT / "t1_iid_ol_ol" / "results",
+        "output": ROOT / "t1_iid_ol_ol" / "results_soft_soc",
     },
     "t2": {
         "label": "T2 AR(1) Gaussian",
         "forecast_column": "forecast_ar1_kW",
-        "output": ROOT / "t2_ar1_ol_ol" / "results",
+        "output": ROOT / "t2_ar1_ol_ol" / "results_soft_soc",
     },
 }
 

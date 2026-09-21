@@ -20,6 +20,7 @@ if str(PHASE4) not in sys.path:
 
 from p4_common import BUS_CONFIG, BUS_ORDER, DT, daily_metrics, make_result_item, read_pa_year
 from p4_run import SETTINGS as PHASE4_SETTINGS
+from soc_soft_band import add_soft_soc_band
 
 
 SCENARIO_FILE = ROOT / "results" / "control_inputs" / "bus_scenarios" / "forecast_scenarios.csv"
@@ -36,13 +37,13 @@ EXPERIMENTS = {
         "label": "T3 IID Gaussian: OL tariff + BESS MPC",
         "scenario": "iid",
         "ol_folder": "t1_iid_ol_ol",
-        "output": ROOT / "t3_iid_ol_mpc" / "results",
+        "output": ROOT / "t3_iid_ol_mpc" / "results_soft_soc",
     },
     "t4": {
         "label": "T4 AR(1) Gaussian: OL tariff + BESS MPC",
         "scenario": "ar1",
         "ol_folder": "t2_ar1_ol_ol",
-        "output": ROOT / "t4_ar1_ol_mpc" / "results",
+        "output": ROOT / "t4_ar1_ol_mpc" / "results_soft_soc",
     },
 }
 
@@ -129,7 +130,7 @@ def _day_realizations(frame, date):
 
 
 def _load_ol_day(config, date):
-    path = ROOT / config["ol_folder"] / "results" / "planned_and_realized_timeseries.csv"
+    path = ROOT / config["ol_folder"] / "results_soft_soc" / "planned_and_realized_timeseries.csv"
     frame = pd.read_csv(path)
     day = frame[frame["date"].astype(str) == pd.Timestamp(date).date().isoformat()].copy()
     if day.empty:
@@ -139,23 +140,9 @@ def _load_ol_day(config, date):
         raise RuntimeError(f"{date}: OL tariff is incomplete or inconsistent across buses")
     pb = day.groupby("step")["pb_eur_per_kwh"].first().sort_index().to_numpy(float)
     ol_net = day.groupby("step")["realized_net_kW"].sum().sort_index().to_numpy(float)
-    metrics = pd.read_csv(ROOT / config["ol_folder"] / "results" / "daily_metrics.csv")
+    metrics = pd.read_csv(ROOT / config["ol_folder"] / "results_soft_soc" / "daily_metrics.csv")
     metric = metrics[metrics["date"].astype(str) == pd.Timestamp(date).date().isoformat()].iloc[0]
     return pb, ol_net, float(metric["solver_mip_gap"]), str(metric["solver_result_status"])
-
-
-def _terminal_reachable_bounds(bus, end_step):
-    cfg = BUS_CONFIG[bus]
-    tolerance = PHASE4_SETTINGS["TERMINAL_ENERGY_TOL_FRAC"] * (
-        cfg["bess_e_max"] - cfg["bess_e_min"]
-    )
-    target_low = max(cfg["bess_e_min"], cfg["bess_e_init"] - tolerance)
-    target_high = min(cfg["bess_e_max"], cfg["bess_e_init"] + tolerance)
-    remaining_steps = STEPS_PER_DAY - int(end_step)
-    reachable_power_energy = remaining_steps * DT * cfg["bess_kw"]
-    low = max(cfg["bess_e_min"], target_low - reachable_power_energy)
-    high = min(cfg["bess_e_max"], target_high + reachable_power_energy)
-    return low, high, target_low, target_high
 
 
 def _solve_bus_mpc(bus, current_energy, baseline, pa, pb, end_step):
@@ -182,9 +169,9 @@ def _solve_bus_mpc(bus, current_energy, baseline, pa, pb, end_step):
         model.addConstr(imp[step] - exp[step] == baseline[step] + bess[step])
         model.addConstr(energy[step + 1] == energy[step] + DT * bess[step])
 
-    reachable_low, reachable_high, target_low, target_high = _terminal_reachable_bounds(bus, end_step)
-    model.addConstr(energy[horizon] >= reachable_low)
-    model.addConstr(energy[horizon] <= reachable_high)
+    soc_penalty, _, _ = add_soft_soc_band(
+        model, energy, horizon, cfg, PHASE4_SETTINGS, bus.replace(" ", "_")
+    )
     objective = gp.quicksum(
         DT * (
             (pa[step] + pb[step] + FLOW_TIE_BREAK) * imp[step]
@@ -192,7 +179,7 @@ def _solve_bus_mpc(bus, current_energy, baseline, pa, pb, end_step):
         )
         for step in range(horizon)
     )
-    model.setObjective(objective, GRB.MINIMIZE)
+    model.setObjective(objective + soc_penalty, GRB.MINIMIZE)
     started = time.perf_counter()
     model.optimize()
     runtime = time.perf_counter() - started
@@ -206,10 +193,8 @@ def _solve_bus_mpc(bus, current_energy, baseline, pa, pb, end_step):
         "objective": float(model.ObjVal),
         "runtime_s": runtime,
         "status": int(model.Status),
-        "reachable_low_kWh": reachable_low,
-        "reachable_high_kWh": reachable_high,
-        "daily_target_low_kWh": target_low,
-        "daily_target_high_kWh": target_high,
+        "soft_soc_low_kWh": PHASE4_SETTINGS["SOC_SOFT_MIN_FRAC"] * cfg["bess_kwh"],
+        "soft_soc_high_kWh": PHASE4_SETTINGS["SOC_SOFT_MAX_FRAC"] * cfg["bess_kwh"],
     }
 
 
