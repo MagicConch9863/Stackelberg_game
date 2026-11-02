@@ -33,8 +33,8 @@ from p4_s3_stackelberg import solve_day as solve_stackelberg_day  # noqa: E402
 def solve_day_with_feasibility_focus(base_solver, date, loads, pv, pa, settings):
     """Run the Phase 4 OL solver with forecast-experiment search defaults."""
     run_settings = dict(settings)
-    run_settings["TIME_LIMIT_S_PER_DAY"] = 1200
-    run_settings["MIP_GAP"] = 0.05
+    run_settings["TIME_LIMIT_S_PER_DAY"] = float(settings.get("TIME_LIMIT_S_PER_DAY", 1200))
+    run_settings["MIP_GAP"] = float(settings.get("MIP_GAP", 0.05))
     run_settings["MIP_FOCUS"] = 1
     gp.setParam("Heuristics", 0.50)
     gp.setParam("NoRelHeurTime", 60)
@@ -42,7 +42,9 @@ def solve_day_with_feasibility_focus(base_solver, date, loads, pv, pa, settings)
     gp.setParam("RINS", 10)
     print(
         "[OL solver] feasibility focus: Heuristics=0.50, "
-        "NoRelHeurTime=60s, PumpPasses=10, RINS=10, TimeLimit=1200s",
+        f"NoRelHeurTime=60s, PumpPasses=10, RINS=10, "
+        f"TimeLimit={run_settings['TIME_LIMIT_S_PER_DAY']:.0f}s, "
+        f"MIPGap={100*run_settings['MIP_GAP']:.1f}%",
         flush=True,
     )
     return base_solver(date, loads, pv, pa, run_settings)

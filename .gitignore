@@ -1,45 +1,159 @@
+# Local environments, editors and caches
 venv/
+.venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .vscode/
-outputs/
-*.pyc
-# 忽略常见图片格式
+.idea/
+.codex_preview/
+Thumbs.db
+Desktop.ini
+~$*
+
+# Machine-specific secrets and Gurobi licences are installed separately.
+.env
+.env.*
+!.env.example
+*.lic
+
+# Runtime logs and machine-local PID/lock state are not portable checkpoints.
+*.log
+**/logs/
+**/status/
+*.lock
+*.pid
+slurm-*.out
+slurm-*.err
+
+# Git carries code and thesis sources only. Transfer data/configs separately.
+*.json
+*.csv
+*.npz
+*.npy
+*.parquet
+*.mat
 *.png
 *.jpg
 *.jpeg
 *.svg
 *.gif
 *.bmp
+*.tif
 *.tiff
-*.csv
-*.npz
-*terminal.log
-*.tex
+*.eps
 *.pdf
-*.bib
-
-# 忽略所有名为 figures 的文件夹及其内容
-**/figures/
+*.pptx
+*.ppt
 **/results/
+**/figures/
 **/csv_results/
-**/presentation/
-**/archive/
-**/analysis/
-# Codex / local preview cache
-.codex_preview/
-
-# Runtime logs
-*.log
-
-# Solver checkpoints and resumable runtime state
 **/checkpoint/
-*.npz
-**/day_ahead_cache_meta.json
 
-# LaTeX intermediate files
+# LaTeX build intermediates only
 *.aux
 *.out
 *.toc
+*.lof
+*.lot
+*.bbl
+*.bcf
+*.blg
+*.run.xml
 *.synctex.gz
+*.pdfsync
 *.fls
 *.fdb_latexmk
+*.nav
+*.snm
+
+# Old experiments: excluded from migration, not deleted locally.
+/tsf_parallel_ol_ol_test/
+/tsf_seasonal_firstseed_40cases/
+/tsf_seasonal_iid20pct_warmup6h/
+/exchange_tests/
+/outputs/
+/logs/
+/status/
+/results/archive/
+/没用/
+/1_LV_urban_0_no_sw/
+
+# HPC-named src/ and data/ are still needed by four_hour_* and input builders.
+/hpc_seasonal_actual_load_noise/cases/
+/hpc_seasonal_actual_load_noise/configs/
+/hpc_seasonal_actual_load_noise/results/
+/hpc_seasonal_actual_load_noise/slurm/
+
+# Preserve phase4 S1-S4 code; its inputs/results are copied separately.
+/stackelberg_scenario_analysis/phase1_der_only/
+/stackelberg_scenario_analysis/phase2/
+/stackelberg_scenario_analysis/phase3_multiday_test/
+/stackelberg_scenario_analysis/pb_sensitivity/
+/stackelberg_scenario_analysis/ca_cb_comparison/
+
+# Keep shared core/data/input_data/tests/analysis and the current presentation.
+/forecast_mpc/soft_soc_simulations/
+/forecast_mpc/noise_and_arx_validation/
+/forecast_mpc/paper/
+/forecast_mpc/archive*/
+/forecast_mpc/comparison_*/
+/forecast_mpc/run_logs*/
+/forecast_mpc/t1_iid_ol_ol/
+/forecast_mpc/t2_ar1_ol_ol/
+/forecast_mpc/t3_iid_ol_mpc/
+/forecast_mpc/t4_ar1_ol_mpc/
+/forecast_mpc/t5_iid_mpc_mpc/
+/forecast_mpc/t5_perfect_mpc_mpc/
+/forecast_mpc/t6_ar1_mpc_mpc/
+/forecast_mpc/presentation/preview*/
+
+# MATLAB/Simulink migration is discontinued.
+/Bericht/Simulink_Uebergabe/
+*.slx
+*.m
+*.mdl
+*.slxc
+*.asv
+slprj/
+
+# Transfer archives and temporary backups; retain their source files instead.
+*.zip
+*.7z
+*.bak
+*.tmp
+
+# Minimal simulation-code transfer: reports, thesis and presentation stay local.
+/paper/
+/Bericht/
+/forecast_mpc/presentation/
+/forecast_mpc/analysis/
+*.tex
+*.bib
+*.md
+*.html
+*.txt
+!requirements.txt
+!**/requirements.txt
+
+# Plotting and presentation builders are outside this transfer.
+**/plot/
+**/plots/
+**/plot_*.py
+**/*_plot.py
+**/plotting.py
+**/build_ppt*.py
+**/build_lecture*.py
+**/render_figures.ps1
+
+# Historical HPC launch/merge helpers are not current solver dependencies.
+/hpc_seasonal_actual_load_noise/src/build_case_matrix.py
+/hpc_seasonal_actual_load_noise/src/merge_results.py
+/hpc_seasonal_actual_load_noise/src/forecast_mpc/soft_soc_simulations/
+
+# Explicit compact handover snapshot only; raw result trees stay ignored.
+!/sync_data/*.csv
+!/sync_data/snapshot.json
+!/sync_data/Uebergabe.txt

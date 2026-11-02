@@ -13,6 +13,7 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SOFT_SOC_ROOT = ROOT / "soft_soc_simulations"
 PROJECT_ROOT = ROOT.parent
 PHASE4 = PROJECT_ROOT / "stackelberg_scenario_analysis" / "phase4"
 if str(PHASE4) not in sys.path:
@@ -27,13 +28,13 @@ SCENARIO_FILE = ROOT / "results" / "control_inputs" / "bus_scenarios" / "forecas
 STEPS_PER_DAY = 96
 HORIZON = 16
 TIME_LIMIT_S_PER_UPDATE = 600.0
-FORMULATION_VERSION = "soft_soc_20_80_v1"
+FORMULATION_VERSION = "soft_soc_20_80_deg_v2"
 
 EXPERIMENTS = {
     "t5_perfect": {
         "label": "T5 diagnostic: perfect forecast + tariff MPC + BESS MPC",
         "scenario": "perfect",
-        "output": ROOT / "t5_perfect_mpc_mpc" / "results_soft_soc",
+        "output": SOFT_SOC_ROOT / "t56_daily" / "t5_perfect",
         "dates": ("2025-01-15",),
         "mip_gap": 0.05,
         "time_limit_s": 600.0,
@@ -41,7 +42,7 @@ EXPERIMENTS = {
     "t5": {
         "label": "T5 IID Gaussian: tariff MPC + BESS MPC",
         "scenario": "iid",
-        "output": ROOT / "t5_iid_mpc_mpc" / "results_soft_soc",
+        "output": SOFT_SOC_ROOT / "t56_daily" / "t5_iid",
         "dates": ("2025-01-15",),
         "mip_gap": 0.05,
         "time_limit_s": 600.0,
@@ -51,7 +52,7 @@ EXPERIMENTS = {
     "t6": {
         "label": "T6 AR(1) Gaussian: tariff MPC + BESS MPC",
         "scenario": "ar1",
-        "output": ROOT / "t6_ar1_mpc_mpc" / "results_soft_soc",
+        "output": SOFT_SOC_ROOT / "t56_daily" / "t6_ar1",
         "dates": ("2025-01-15",),
         "mip_gap": 0.05,
         "time_limit_s": 600.0,
@@ -100,8 +101,8 @@ def _follower_lp(bus, baseline, current_energy, origin_step):
     baseline = np.asarray(baseline, dtype=float)
     horizon = len(baseline)
     cfg = BUS_CONFIG[bus]
-    # [BESS, import, export, SOC-under-slack, SOC-over-slack]
-    q = 5 * horizon
+    # [BESS, import, export, SOC-under-slack, SOC-over-slack, BESS-throughput]
+    q = 6 * horizon
     aeq, beq, aub, bub = [], [], [], []
 
     # -BESS + import - export = baseline, i.e. import-export=load-PV+BESS.
@@ -135,18 +136,34 @@ def _follower_lp(bus, baseline, current_energy, origin_step):
         aub.append(high_row)
         bub.append(soft_high - current_energy)
 
+    # P_throughput >= |P_BESS|. Since c_deg > 0, this is tight at optimum and
+    # represents P_ch + P_dis without introducing a charge/discharge binary.
+    for step in range(horizon):
+        positive = np.zeros(q)
+        positive[step] = 1.0
+        positive[5 * horizon + step] = -1.0
+        aub.append(positive)
+        bub.append(0.0)
+
+        negative = np.zeros(q)
+        negative[step] = -1.0
+        negative[5 * horizon + step] = -1.0
+        aub.append(negative)
+        bub.append(0.0)
+
     # At an optimum import and export cannot both be positive because PB >= 0
     # and epsilon > 0. These per-period bounds are therefore exact, not heuristic.
     bess_limit = float(cfg["bess_kw"])
     import_ub = np.maximum(baseline + bess_limit, 0.0)
     export_ub = np.maximum(-baseline + bess_limit, 0.0)
-    lb = np.r_[np.full(horizon, -cfg["bess_kw"]), np.zeros(4 * horizon)]
+    lb = np.r_[np.full(horizon, -cfg["bess_kw"]), np.zeros(5 * horizon)]
     ub = np.r_[
         np.full(horizon, cfg["bess_kw"]),
         import_ub,
         export_ub,
         np.full(horizon, soft_low - physical_low),
         np.full(horizon, physical_high - soft_high),
+        np.full(horizon, cfg["bess_kw"]),
     ]
     return (
         np.asarray(aeq), np.asarray(beq), np.asarray(aub), np.asarray(bub), lb, ub,
@@ -171,7 +188,7 @@ def _add_follower_kkt(
     )
     aeq, beq, aub, bub, lb, ub = packed[:6]
     horizon = len(baseline)
-    q = 5 * horizon
+    q = 6 * horizon
     tag = bus.replace(" ", "_")
     epsilon = float(PHASE4_SETTINGS["FLOW_TIE_BREAK_EUR_PER_KWH"])
     max_marginal_cost = DT * max(
@@ -182,6 +199,7 @@ def _add_follower_kkt(
     max_marginal_cost = max(
         max_marginal_cost,
         float(PHASE4_SETTINGS["SOC_SOFT_PENALTY_EUR_PER_KWH"]),
+        DT * float(PHASE4_SETTINGS["BESS_DEGRADATION_EUR_PER_KWH"]),
     )
     min_dynamic_coefficient = min(DT, 1.0)
     derived_dual_bound = 1.0 + horizon * max_marginal_cost / min_dynamic_coefficient
@@ -233,8 +251,10 @@ def _add_follower_kkt(
         elif j < 3 * horizon:
             step = j - 2 * horizon
             cost = DT * (-pa[step] + epsilon)
-        else:
+        elif j < 5 * horizon:
             cost = float(PHASE4_SETTINGS["SOC_SOFT_PENALTY_EUR_PER_KWH"])
+        else:
+            cost = DT * float(PHASE4_SETTINGS["BESS_DEGRADATION_EUR_PER_KWH"])
         equality_terms = gp.quicksum(aeq[i, j] * lam[i] for i in np.flatnonzero(aeq[:, j]))
         inequality_terms = gp.quicksum(aub[i, j] * mu[i] for i in np.flatnonzero(aub[:, j]))
         if lower_dual[j] is not None:
@@ -313,13 +333,33 @@ def _solve_stackelberg_window(
         # longer invisible to the receding-horizon leader objective.
         model.addConstr(peak >= float(previous_realized_net), name="anchor_peak")
         model.addConstr(valley <= float(previous_realized_net), name="anchor_valley")
+    aggregate_grid = {}
     for step in range(horizon):
-        aggregate = gp.quicksum(
+        aggregate_grid[step] = gp.quicksum(
             x[bus][horizon + step] - x[bus][2 * horizon + step] for bus in BUS_ORDER
         )
-        model.addConstr(peak >= aggregate)
-        model.addConstr(valley <= aggregate)
-    model.setObjective(peak - valley, GRB.MINIMIZE)
+        model.addConstr(peak >= aggregate_grid[step])
+        model.addConstr(valley <= aggregate_grid[step])
+
+    leader_ramp_weight = float(PHASE4_SETTINGS.get("LEADER_RAMP_WEIGHT", 0.0))
+    ramp_abs = {}
+    if leader_ramp_weight > 0.0:
+        for step in range(horizon):
+            if step == 0:
+                if previous_realized_net is None:
+                    continue
+                delta = aggregate_grid[step] - float(previous_realized_net)
+            else:
+                delta = aggregate_grid[step] - aggregate_grid[step - 1]
+            ramp_abs[step] = model.addVar(lb=0.0, name=f"grid_ramp_abs_{step}")
+            model.addConstr(ramp_abs[step] >= delta)
+            model.addConstr(ramp_abs[step] >= -delta)
+
+    model.setObjective(
+        peak - valley
+        + leader_ramp_weight * gp.quicksum(ramp_abs.values()),
+        GRB.MINIMIZE,
+    )
     model.optimize()
     if model.SolCount == 0:
         raise RuntimeError(f"{date.date()} step {origin}: no incumbent, status={model.Status}")
@@ -356,6 +396,9 @@ def _solve_stackelberg_window(
         "bounds": bounds,
         "dual_big_m": max(dual_bounds.values()),
         "max_dual_bound_fraction": float(max_dual_fraction),
+        "constraint_violation": float(model.ConstrVio),
+        "bound_violation": float(model.BoundVio),
+        "integrality_violation": float(model.IntVio),
     }
 
 

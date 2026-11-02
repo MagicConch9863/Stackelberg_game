@@ -39,7 +39,14 @@ def _solve_follower(bus, current_energy, baseline, pa, pb, origin):
     model = gp.Model(f"{bus.replace(' ', '_')}_{origin}")
     model.Params.OutputFlag = 0
     model.Params.Threads = 1
-    bess = model.addVars(h, lb=-cfg["bess_kw"], ub=cfg["bess_kw"], name="bess")
+    degradation_rate = float(PHASE4_SETTINGS.get("BESS_DEGRADATION_EUR_PER_KWH", 0.0))
+    if degradation_rate > 0.0:
+        charge = model.addVars(h, lb=0.0, ub=cfg["bess_kw"], name="charge")
+        discharge = model.addVars(h, lb=0.0, ub=cfg["bess_kw"], name="discharge")
+        bess = {j: charge[j] - discharge[j] for j in range(h)}
+    else:
+        charge = discharge = None
+        bess = model.addVars(h, lb=-cfg["bess_kw"], ub=cfg["bess_kw"], name="bess")
     imp = model.addVars(h, lb=0.0, ub=PHASE4_SETTINGS["GRID_BOUND_KW"], name="imp")
     exp = model.addVars(h, lb=0.0, ub=PHASE4_SETTINGS["GRID_BOUND_KW"], name="exp")
     energy = model.addVars(h + 1, lb=cfg["bess_e_min"], ub=cfg["bess_e_max"], name="energy")
@@ -52,12 +59,113 @@ def _solve_follower(bus, current_energy, baseline, pa, pb, origin):
     )
     energy_cost = gp.quicksum(DT * ((pa[j] + pb[j] + FLOW_TIE_BREAK) * imp[j]
                               + (-pa[j] + FLOW_TIE_BREAK) * exp[j]) for j in range(h))
-    model.setObjective(energy_cost + soc_penalty, GRB.MINIMIZE)
+    degradation_cost = (
+        gp.quicksum(DT * degradation_rate * (charge[j] + discharge[j]) for j in range(h))
+        if charge is not None else 0.0
+    )
+    model.setObjective(energy_cost + soc_penalty + degradation_cost, GRB.MINIMIZE)
     started = time.perf_counter()
     model.optimize()
     if model.Status != GRB.OPTIMAL:
         raise RuntimeError(f"Follower {bus}, origin {origin}: status={model.Status}")
-    return np.array([bess[j].X for j in range(h)]), np.array([energy[j].X for j in range(h + 1)]), time.perf_counter() - started
+    if charge is not None:
+        bess_values = np.array([charge[j].X - discharge[j].X for j in range(h)])
+    else:
+        bess_values = np.array([bess[j].X for j in range(h)])
+    return bess_values, np.array([energy[j].X for j in range(h + 1)]), time.perf_counter() - started
+
+
+def _add_follower_problem(model, bus, initial_energy, baseline, pa, pb, prefix):
+    """Add one Follower LP and return its variables and complete objective."""
+    h = len(baseline)
+    cfg = BUS_CONFIG[bus]
+    charge = model.addVars(h, lb=0.0, ub=cfg["bess_kw"], name=f"charge_{prefix}")
+    discharge = model.addVars(h, lb=0.0, ub=cfg["bess_kw"], name=f"discharge_{prefix}")
+    imp = model.addVars(h, lb=0.0, ub=PHASE4_SETTINGS["GRID_BOUND_KW"], name=f"imp_{prefix}")
+    exp = model.addVars(h, lb=0.0, ub=PHASE4_SETTINGS["GRID_BOUND_KW"], name=f"exp_{prefix}")
+    energy = model.addVars(h + 1, lb=cfg["bess_e_min"], ub=cfg["bess_e_max"], name=f"energy_{prefix}")
+    model.addConstr(energy[0] == initial_energy)
+    for step in range(h):
+        model.addConstr(imp[step] - exp[step] == baseline[step] + charge[step] - discharge[step])
+        model.addConstr(energy[step + 1] == energy[step] + DT * (charge[step] - discharge[step]))
+    soc_penalty, _, _ = add_soft_soc_band(model, energy, h, cfg, PHASE4_SETTINGS, prefix)
+    degradation = float(PHASE4_SETTINGS.get("BESS_DEGRADATION_EUR_PER_KWH", 0.0))
+    energy_cost = gp.quicksum(
+        DT * ((pa[j] + pb[j] + FLOW_TIE_BREAK) * imp[j]
+              + (-pa[j] + FLOW_TIE_BREAK) * exp[j]) for j in range(h)
+    )
+    degradation_cost = gp.quicksum(
+        DT * degradation * (charge[j] + discharge[j]) for j in range(h)
+    )
+    return {"charge": charge, "discharge": discharge, "imp": imp, "exp": exp,
+            "energy": energy, "cost": energy_cost + soc_penalty + degradation_cost}
+
+
+def _follower_minimum_cost(bus, initial_energy, baseline, pa, pb, origin):
+    model = gp.Model(f"primary_{bus.replace(' ', '_')}_{origin}")
+    model.Params.OutputFlag = 0
+    model.Params.Threads = 1
+    item = _add_follower_problem(model, bus, initial_energy, baseline, pa, pb, "primary")
+    model.setObjective(item["cost"], GRB.MINIMIZE)
+    model.optimize()
+    if model.Status != GRB.OPTIMAL:
+        raise RuntimeError(f"Primary Follower {bus}, origin {origin}: status={model.Status}")
+    return float(model.ObjVal)
+
+
+def solve_optimistic_followers(energies, forecast, pa, pb, origin,
+                               previous_realized_net=None,
+                               absolute_tolerance=1e-7, relative_tolerance=1e-6):
+    """Select the Leader-best response among cost-optimal fixed-price Followers."""
+    started = time.perf_counter()
+    baselines = {bus: forecast["load"][bus] - forecast["pv"][bus] for bus in BUS_ORDER}
+    primary = {
+        bus: _follower_minimum_cost(bus, energies[bus], baselines[bus], pa, pb, origin)
+        for bus in BUS_ORDER
+    }
+    h = len(pa)
+    model = gp.Model(f"optimistic_followers_{origin}")
+    model.Params.OutputFlag = 0
+    model.Params.Threads = 1
+    followers = {}
+    for bus in BUS_ORDER:
+        tag = bus.replace(" ", "_").lower()
+        item = _add_follower_problem(model, bus, energies[bus], baselines[bus], pa, pb, tag)
+        tolerance = max(absolute_tolerance, relative_tolerance * max(1.0, abs(primary[bus])))
+        model.addConstr(item["cost"] <= primary[bus] + tolerance, name=f"optimal_cost_{tag}")
+        followers[bus] = item
+    aggregate = [gp.quicksum(followers[b]["imp"][j] - followers[b]["exp"][j]
+                             for b in BUS_ORDER) for j in range(h)]
+    peak = model.addVar(lb=-GRB.INFINITY, name="peak")
+    valley = model.addVar(lb=-GRB.INFINITY, name="valley")
+    for value in aggregate:
+        model.addConstr(peak >= value); model.addConstr(valley <= value)
+    ramp_weight = float(PHASE4_SETTINGS.get("LEADER_RAMP_WEIGHT", 0.0))
+    ramp_terms = []
+    if ramp_weight > 0.0 and previous_realized_net is not None:
+        first = model.addVar(lb=0.0, name="grid_ramp_0")
+        model.addConstr(first >= aggregate[0] - previous_realized_net)
+        model.addConstr(first >= previous_realized_net - aggregate[0]); ramp_terms.append(first)
+    if ramp_weight > 0.0:
+        for j in range(1, h):
+            term = model.addVar(lb=0.0, name=f"grid_ramp_{j}")
+            model.addConstr(term >= aggregate[j] - aggregate[j - 1])
+            model.addConstr(term >= aggregate[j - 1] - aggregate[j]); ramp_terms.append(term)
+    model.setObjective(peak - valley + ramp_weight * gp.quicksum(ramp_terms), GRB.MINIMIZE)
+    model.optimize()
+    if model.Status != GRB.OPTIMAL:
+        raise RuntimeError(f"Optimistic response origin {origin}: status={model.Status}")
+    actions = {bus: float(followers[bus]["charge"][0].X - followers[bus]["discharge"][0].X)
+               for bus in BUS_ORDER}
+    next_energy = {bus: float(followers[bus]["energy"][1].X) for bus in BUS_ORDER}
+    selected = {bus: float(followers[bus]["cost"].getValue()) for bus in BUS_ORDER}
+    return actions, next_energy, time.perf_counter() - started, {
+        "primary_cost": primary, "selected_cost": selected,
+        "max_cost_gap_eur": max(selected[b] - primary[b] for b in BUS_ORDER),
+        "leader_objective": float(model.ObjVal),
+        "leader_peak_to_valley_kw": float(peak.X - valley.X),
+        "leader_ramp_l1_kw": float(sum(term.X for term in ramp_terms)),
+    }
 
 
 def _day_ahead_pb(name, scenario, output, actual, pa, timestamps):

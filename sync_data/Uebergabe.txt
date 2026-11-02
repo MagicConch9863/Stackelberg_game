@@ -1,0 +1,213 @@
+Stackelberg–MPC研究交接說明
+快照日期：2026-11-02；資料生成時刻以snapshot.json的exported_at為準。
+================================================================
+
+1. 此資料夾的用途與邊界
+
+本資料夾是其他桌面理解目前研究、讀取數據和重新繪圖的精簡交接包。
+只在此資料夾對必要CSV/JSON開放Git追蹤，避免整個工作區數千結果檔進入Git。
+不包含已生成圖片、演講稿、MATLAB/Simulink、詳細日誌及大型checkpoint。
+原始結果保留在來源機，不刪除。此快照不是另一個仍會自動更新的數據庫。
+
+本次匯出248個案例狀態、173條完整三日時序。來源為：
+  a. four_hour_selected：80個原正式案例，使用現有current_review資料來源表
+     所選的完整軌跡，其中部分已被完整因果復算替換。
+  b. monte_carlo_3seeds：48個新增seed案例的狀態，46條完整軌跡。
+  c. horizon_screening：120個時域篩查案例的狀態，47條完整軌跡。
+同一案例不因舊圖片較漂亮而選回原結果，也不人工平滑原始數據。
+完成不等於所有窗口gap達標；solver_windows.csv用於進一步篩選。
+
+2. 工作演變：哪些結果屬於目前研究
+
+早期採用過日前SOC reference、terminal corridor、午夜條件，以及僅在
+預測中加噪的版本。這些不是目前模型，舊圖與舊KPI不能直接混入新研究。
+目前轉向soft SOC、真實負荷擾動、明確因果量測時序及允許反向送電。
+上週和本週的主要工作集中在：
+  - four_hour_test：P2V+Ramp，4h OL與4h MPC，同一物理設定比較。
+  - four_hour_peak_ramp：Peak+Ramp對照，其他設定保持相同。
+  - 四季、Perfect/IID/AR(1)、S1/S2種子，完整因果復算與高gap窗口復核。
+  - monte_carlo_3seeds：在P2V+Ramp、4h條件增加三個seed。
+  - horizon_screening：MPC2/4/6/8h與OL24h，兩目標、四季、三種擾動、S1。
+不同階段的warmup及初始狀態設計不同，不能不加區分直接合併統計。
+
+S1–S4還有另一個含義：phase4的四種控制場景，不是隨機種子。
+  S1無控制；S2固定價格Follower反應；S3 Stackelberg；S4集中控制。
+其現存彙總統計保存在s1_s4_statistics.csv，配置在snapshot.json。
+來源端目前沒有一併提供所有phase4逐日原始曲線，因此不聲稱可由此還原
+全部S1–S4逐時實驗；舊phase4統計也不與近期因果4h案例直接混算。
+
+3. 物理與經濟模型
+
+四個獨立家庭/Prosumer，Leader發布附加價格PB，Follower各自最小化成本。
+聚合只用於Leader的Grid指標，不代表Bus之間有專用PV共享或建模了潮流。
+SimBench映射為BUS6(index6)、BUS8(index8)、BUS14(index14)、BUS16(index17)。
+目前不是Simscape或含R/X、電壓限制的配電網動態模型。
+
+容量為8、5、8、8 kWh；功率上限2.5、1.5、2.5、2.5 kW。
+時間解析度dt=0.25h；有符號u>0代表充電，u<0代表放電；當前效率模型為1。
+E(k+1)=E(k)+dt*u(k)。完整預運行的初始SOC為50%；時域篩查正式初態
+由共同4h預運行終態提供，並非每組在正式00:00重新回到50%。
+
+硬邊界：0<=E<=Emax，功率同樣受硬邊界約束。
+軟區間：E+nu_low>=0.2Emax，E-nu_high<=0.8Emax，兩個slack非負。
+SOC懲罰rho_SOC*sum(nu_low+nu_high)，目前rho_SOC=1。
+注意：程式該項沒有額外乘dt；與能量交易項的尺度不同。
+沒有每日SOC重置、終端SOC目標、午夜fix或日前SOC reference。
+
+每家庭功率平衡：Pimp-Pexp=L-PV+u。
+Grid=sum_i(L_i-PV_i+u_i)，可為負，代表售電/反向輸入公共電網。
+目前4h/時域篩查不把負Grid強制裁成0，也沒有新增的強制PV充電條件。
+不能再用此前「負Grid在聚合層被截斷、Follower仍計出口收益」的解釋。
+
+Follower LP的主要成本：
+ dt*sum[(PA+PB+eps)*Pimp+(-PA+eps)*Pexp+cdeg*v]
+ +rho_SOC*sum(nu_low+nu_high)，v>=u、v>=-u，cdeg=0.05，eps=1e-5。
+PB限制及價格連續設定、LP/KKT詳細係數以凍結核心與manifest為準。
+目前無單獨加入買賣互斥binary；LP交易價差抑制同時購售，不能將其描述為
+已實作硬互斥整數約束。
+
+Leader兩種目標：
+  P2V+Ramp：max(Grid)-min(Grid)+0.05*sum(abs(Grid[k]-Grid[k-1]))。
+  Peak+Ramp：非負進口Peak變量+0.05*sum(abs(Grid[k]-Grid[k-1]))。
+P2V模型的前一實際Grid也進入peak/valley anchor；Peak模型前一Grid僅用
+首個ramp，兩者anchor定義不是完全相同。沒有硬ramp上限。
+Follower LP透過KKT嵌入Leader MILP，採optimistic多最優解選擇。
+不在Leader求解後再用另一個獨立Follower最優解任意替換。
+
+4. 四季輸入、擾動和因果預測
+
+正式日期為2025-01-15、04-15、07-15、10-15起連續三天，共288個15min點。
+舊4h實驗自前一天20:00預運行4h，共304個執行點，19:45另有量測歷史。
+時域篩查共用同組原S1-MPC的16步預運行終態，跨視野初始E/PB/Grid一致。
+其輸入336點=1歷史+16預運行+288正式+31緩衝，保持最後8h視野完整。
+OL24h正式自00:00開始三個96步區塊，不縮短第三天規劃。
+
+真實負荷：Lreal=max(0,Lnominal+d)；PV不加噪。
+PV的精確來源和原縮放見snapshot中的source配置和各case manifest。
+現階段使用參考PV形狀及季節性處理，不應籠統聲稱每季均使用完整真實
+逐日2025 PV。夏季另外縮小；時域篩查固定沿用原S1標定，避免緩衝長度
+改變PV倍率。精確pv_scale逐case記錄，不憑曲線猜測倍率。
+
+IID：d=w，w~N(0,sigma_IID^2)。
+AR(1)：d(k)=rho*d(k-1)+w(k)，rho=0.9。
+目前matched marginal採sigma_w=sigma_IID*sqrt(1-rho^2)。
+每季sigma_IID=0.20*正式期名義聚合淨負荷均值/sqrt(4)。
+20%是截斷前聚合擾動標準差相對名義均值的設計比例，不是每點誤差比，
+也不保證有限樣本、非負截斷後的經驗比例剛好20%。
+Bus噪聲獨立，初始擾動0，精確實現直接用realizations.csv，勿在另一端
+只因seed相同就假定不同軟體產生相同亂數。
+
+目前決策k只知道已完成區間k-1的量測與當前SOC，不預讀未來噪聲。
+殘差dhat(k-1)=Lreal(k-1)-Lnominal(k-1)。
+對h=0,...,H-1：
+  Perfect：Lhat(k+h|k)=Lnominal(k+h)。
+  IID：Lhat(k+h|k)=Lnominal(k+h)，未來IID期望0。
+  AR(1) MPC：Lhat(k+h|k)=max(0,Lnominal(k+h)+rho^(h+1)*dhat(k-1))。
+這不是隨機重新抽一條預測，也不是資料訓練或未知rho辨識；模型知道rho。
+OL各區塊使用nominal，不使用未來真實噪聲。
+MPC每15min重新求解只執行一步，OL執行完整區塊，再依實際承接SOC規劃。
+
+5. 目前試驗數量與運行狀態
+
+原4h正式試驗80組：四季*(Perfect1個+IID兩seed+AR1兩seed)*兩方法*兩目標。
+Perfect共享同一確定性案例，不能把共享Perfect複製視為獨立樣本。
+S1=20250903、S2=20250917；當前繪圖來源表包含已完成因果復算替換，
+selection/replaced_source與SHA256保存在cases.csv和snapshot中。
+
+新增seed批次48組：4季*2噪聲*3seed*2方法，只測P2V+Ramp和4h。
+S3=20251001、S4=20251015、S5=20251029。46完成，2失敗，未進行最終復核。
+
+時域篩查120組：4季*3情況*5方法*2目標*1seed。
+5方法是MPC2/4/6/8h與OL24h。正式MPC各288次，OL24h共3次。
+暫停6h/8h後，2h已24/24完成，4h23/24完成，OL24h24組首輪全失敗。
+11月1日19:38:50最後正式案例結束，19:39排程結束；
+11月2日09:02系統重啟，15:03重新安排1個4h及24個OL24h重試。
+快照時47完成、14運行、11等待、3長視野失敗、45長視野暫停。
+可變動狀態請查來源機最新terminal_status.log；此文件不能當即時看板。
+
+目前最多14案例並行、每案例12個Gurobi執行緒，數值庫執行緒1。
+早期案例曾用8執行緒，耗時比較不是完全統一硬體設定。
+此TSF有Process Lasso限制每工作階段15個python.exe，調度器也佔一個，
+不是CPU只有25%就能任意增加案例。本交接不更改其密碼保護管理規則。
+
+6. 求解品質與尚未解決問題
+
+通常60/120/300s逐次嘗試，目標gap10%；第二次後<=20%可接受；
+300s後有效可行解即使gap較高也可繼續，標記品質，從未取得有效解才600s。
+需要有限objective/bound/gap和物理/KKT殘差檢查，容差3e-5。
+這些設定不保證10%目標每一步都達成。solver_windows提供原窗口gap和
+融合候選/界限後gap，切勿把兩者混稱。未完成窗口的耗時不在匯出累計中。
+目前MIPFocus=3；Dual Big-M有啟發式上界100，長視野的有效性仍需診斷。
+24h OL全失敗常出現在首個96步模型無有效incumbent，不能解釋成物理不可行。
+重試可能仍失敗，不應無限重跑或靜默放寬SOC/硬約束。
+完整復算後的曲線才可取代連續軌跡；固定狀態單窗口audit不是新的完整仿真。
+
+不能預設MPC一定優於OL或AR1一定更差。共同硬約束、相同輸入、gap差異、
+有限視野、optimistic多解與誤差結構均可能影響結果。
+不同視野的計算時間增長很大；目前沒有足夠完整6h/8h/OL24h配對下結論。
+
+7. CSV/JSON怎麼用
+
+cases.csv：全部案例狀態、來源、選擇理由、hash、完成/高gap窗口數。
+timeseries.csv：173個完成案例的原始288點，保留Grid、Uncontrolled、PB/PA、
+  四Bus動作、能量、slack。按case_id分組，不要依檔案行順序拼接不同案例。
+realizations.csv：對應完整噪聲實現、名義/實際負荷、PV及截斷指標。
+nominal_inputs.csv：以input_file分組，包含原輸入與共同warmup CSV。
+solver_windows.csv：逐窗口gap、status、目標/界、品質、嘗試次數及已記錄耗時。
+daily_kpi.csv：每日96點的Peak、Valley、P2V、相對同場景Uncontrolled變化，
+  70%無控制Peak門檻占比、自身95%近峰占比、配對共同95%門檻占比、波動率。
+  百分比變化=(controlled/baseline-1)*100，負值代表降低，不是百分點差。
+  共同95%門檻=.95*min(同組OL每日Peak,同組MPC每日Peak)。無完整對照則留空。
+  負Peak時這些門檻不適合；相關占比留空，不硬算成誤導值。
+  波動率是15min差分的總體標準差，並未檢驗高斯性。
+  第二/三天首個差分包含前一天最後點；第一天沒有匯出warmup末點，故
+  暫不包含第一天第一個跨warmup差分。其他逐日指標使用完整96點。
+s1_s4_statistics.csv：現存phase4彙總表，source_file區分不同指標表。
+snapshot.json：配置全文、每case manifest、輸入來源、匯出時間和覆蓋資訊。
+  manifest可能仍含來源機絕對路徑，目標端需重新定位；case來源另有相對路徑。
+
+圖表建議按季節/情況/seed/方法/視野/目標配對，三天指標分日統計。
+不要把三天當三個獨立seed；一seed時不要偽造跨seed箱形統計。
+現在保留正式三天全部96點/日，不再刪第一天前6h，因已有預運行。
+德語標籤，300dpi，按頁面尺寸設字體；不人工平滑或只更新圖而不更新原數據。
+舊圖可能採三天聚合指標，此包daily_kpi是明確逐日新定義，不冒充舊圖同一KPI。
+
+8. 在另一台機器如何恢復與同步
+
+若僅分析/繪圖：讀上述CSV/JSON即可，不必安裝Gurobi，不必有來源機status。
+若要重畫已選正式曲線，使用timeseries的原值；不需重新抽噪聲。
+本包不含每origin所有rolling forecast明細，只提供預測公式、配置與實際實現。
+若需要逐窗口預測精確回放，另傳原rolling_forecasts.csv。
+
+若要繼續優化：還需另行傳輸結果目錄中的checkpoint.json、previous備份、
+  manifest、完整config/inputs及所需rolling plan，不可只憑本包聲稱可熱啟動。
+保留各實驗source凍結核心和hash，不把幾套版本任意合併重構。
+輸入/JSON原路徑目前被Git忽略；可從snapshot.configs和nominal_inputs重建，
+  或另行直接複製原configs/inputs，後者最穩妥。
+使用相同Python/NumPy可重現實現；Gurobi多執行緒/版本差異仍可改變求解路徑。
+安裝有效Gurobi licence，檢查requirements與Python版本，不上傳licence或venv。
+guard.ps1含Python絕對路徑，排程與venv位置需在目的端修改；目前調度只支援Windows。
+不要沿用來源機PID/status；重建時completed由結果檔辨識，其他從checkpoint接續。
+缺status可能重新嘗試原failed，先看cases.csv確認待跑範圍。
+兩台機器不要同時寫入同一結果資料夾；完整恢復包應在一致快照時複製。
+
+9. 夜間調度與後續順序
+
+目前先完成2h/4h及24h OL，6h/8h保留暫停，不自動恢復。
+待時域比較後再選視野：固定邊際幅度rho=0/.5/.9，再固定rho=.9縮放幅度，
+最後擴展seed及集中處理失敗/高gap。選定視野和幅度網格尚未由結果定案。
+
+為避免閃窗，分鐘監控現改為wscript.exe啟動guard_hidden.vbs，隱藏執行PS；
+求解worker使用CREATE_NO_WINDOW與STARTF_USESHOWWINDOW=0，guard用
+ProcessStartInfo.CreateNoWindow。現有求解不需要為此重算。
+此措施針對本專案任務，不是修改系統所有應用程式的窗口行為。
+
+10. 如何更新本交接包
+
+tools/export_sync_data.py是只讀匯出器，不啟動仿真、不修改原結果、不繪圖。
+執行：python tools/export_sync_data.py。
+輸出會覆蓋sync_data內7個CSV和snapshot.json，不覆蓋本說明。
+只收完整288點軌跡，驗證功率平衡；運行/失敗案例僅匯出其狀態與已保存窗口品質。
+來源機正在運行時這是逐檔快照，不是全目錄原子備份；精確接續需獨立一致checkpoint。
+Git只對sync_data指定檔案開例外，原始數千CSV/JSON、圖片與圖程式仍被忽略。
+沒有在此步驟自動提交或推送；其他桌面需取得明確提交版本及對應snapshot。

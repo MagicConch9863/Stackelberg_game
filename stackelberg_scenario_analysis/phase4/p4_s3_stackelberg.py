@@ -8,17 +8,29 @@ from soc_soft_band import soc_limits
 
 def follower_lp(bus, baseline, settings):
     cfg = BUS_CONFIG[bus]
-    # [BESS, import, export, SOC-under-slack, SOC-over-slack]
-    q = 5 * T
+    initial_by_bus = settings.get("BESS_INITIAL_ENERGY_KWH", {})
+    initial_energy = float(initial_by_bus.get(bus, cfg["bess_e_init"]))
+    if not cfg["bess_e_min"] <= initial_energy <= cfg["bess_e_max"]:
+        raise ValueError(f"Invalid initial BESS energy for {bus}: {initial_energy}")
+    has_degradation = float(settings.get("BESS_DEGRADATION_EUR_PER_KWH", 0.0)) > 0.0
+    # Base: [BESS, import, export, SOC-under, SOC-over].
+    # Degradation: [charge, discharge, import, export, SOC-under, SOC-over].
+    q = (6 if has_degradation else 5) * T
 
     aeq, beq, aub, bub = [], [], [], []
 
     # import - export = baseline + BESS
     for t in range(T):
         row = np.zeros(q)
-        row[t] = 1.0
-        row[T + t] = -1.0
-        row[2 * T + t] = 1.0
+        if has_degradation:
+            row[t] = 1.0
+            row[T + t] = -1.0
+            row[2 * T + t] = -1.0
+            row[3 * T + t] = 1.0
+        else:
+            row[t] = 1.0
+            row[T + t] = -1.0
+            row[2 * T + t] = 1.0
         aeq.append(row)
         beq.append(-baseline[t])
 
@@ -26,10 +38,12 @@ def follower_lp(bus, baseline, settings):
     for k in range(1, T + 1):
         row = np.zeros(q)
         row[:k] = DT
+        if has_degradation:
+            row[T:T + k] = -DT
         aub.extend((row, -row))
         bub.extend((
-            cfg["bess_e_max"] - cfg["bess_e_init"],
-            cfg["bess_e_init"] - cfg["bess_e_min"],
+            cfg["bess_e_max"] - initial_energy,
+            initial_energy - cfg["bess_e_min"],
         ))
 
     physical_low, physical_high, soft_low, soft_high = soc_limits(cfg, settings)
@@ -38,37 +52,46 @@ def follower_lp(bus, baseline, settings):
     for k in range(1, T + 1):
         low_row = np.zeros(q)
         low_row[:k] = -DT
-        low_row[3 * T + k - 1] = -1.0
+        if has_degradation:
+            low_row[T:T + k] = DT
+            low_row[4 * T + k - 1] = -1.0
+        else:
+            low_row[3 * T + k - 1] = -1.0
         aub.append(low_row)
-        bub.append(cfg["bess_e_init"] - soft_low)
+        bub.append(initial_energy - soft_low)
 
         high_row = np.zeros(q)
         high_row[:k] = DT
-        high_row[4 * T + k - 1] = -1.0
+        if has_degradation:
+            high_row[T:T + k] = -DT
+            high_row[5 * T + k - 1] = -1.0
+        else:
+            high_row[4 * T + k - 1] = -1.0
         aub.append(high_row)
-        bub.append(soft_high - cfg["bess_e_init"])
+        bub.append(soft_high - initial_energy)
 
     grid_bound = float(settings["GRID_BOUND_KW"])
-
-    lb = np.r_[
-        np.full(T, -cfg["bess_kw"]),
-        np.zeros(T),
-        np.zeros(T),
-        np.zeros(T),
-        np.zeros(T),
-    ]
-    ub = np.r_[
-        np.full(T, cfg["bess_kw"]),
-        np.full(T, grid_bound),
-        np.full(T, grid_bound),
-        np.full(T, soft_low - physical_low),
-        np.full(T, physical_high - soft_high),
-    ]
+    if has_degradation:
+        lb = np.zeros(6 * T)
+        ub = np.r_[
+            np.full(T, cfg["bess_kw"]), np.full(T, cfg["bess_kw"]),
+            np.full(T, grid_bound), np.full(T, grid_bound),
+            np.full(T, soft_low - physical_low),
+            np.full(T, physical_high - soft_high),
+        ]
+    else:
+        lb = np.r_[np.full(T, -cfg["bess_kw"]), np.zeros(4 * T)]
+        ub = np.r_[
+            np.full(T, cfg["bess_kw"]),
+            np.full(T, grid_bound), np.full(T, grid_bound),
+            np.full(T, soft_low - physical_low),
+            np.full(T, physical_high - soft_high),
+        ]
 
     return tuple(map(np.asarray, (aeq, beq, aub, bub))) + (lb, ub)
 
 
-def complementarity(model, slack_expr, slack_max, dual, name, dual_max):
+def complementarity(model, slack_expr, slack_max, dual, name, dual_max, start_slack=None):
     maximum = max(float(slack_max), 0.0)
     binary = model.addVar(vtype=GRB.BINARY, name=f"z_{name}")
     slack = model.addVar(lb=0.0, ub=maximum, name=f"slack_{name}")
@@ -76,11 +99,54 @@ def complementarity(model, slack_expr, slack_max, dual, name, dual_max):
     model.addConstr(slack == slack_expr)
     model.addConstr(slack <= maximum * binary)
     model.addConstr(dual <= dual_max * (1.0 - binary))
+    if start_slack is not None:
+        start_slack = max(float(start_slack), 0.0)
+        slack.Start = start_slack
+        binary.Start = 1.0 if start_slack > 1e-7 else 0.0
 
 
-def add_kkt(model, bus, baseline, pa, pb, settings):
+def follower_primal_warm_start(bus, baseline, pa, pb_values, settings):
+    """Solve the fixed-tariff follower LP and return a primal KKT start."""
     aeq, beq, aub, bub, lb, ub = follower_lp(bus, baseline, settings)
-    q = 5 * T
+    q = len(lb)
+    model = gp.Model(f"warm_{bus.replace(' ', '_')}")
+    model.Params.OutputFlag = 0
+    x = model.addVars(q, lb=-GRB.INFINITY, name="x")
+    for j in range(q):
+        model.addConstr(x[j] >= float(lb[j]))
+        model.addConstr(x[j] <= float(ub[j]))
+    for i, row in enumerate(aeq):
+        nz = np.flatnonzero(row)
+        model.addConstr(gp.quicksum(row[j] * x[j] for j in nz) == float(beq[i]))
+    for i, row in enumerate(aub):
+        nz = np.flatnonzero(row)
+        model.addConstr(gp.quicksum(row[j] * x[j] for j in nz) <= float(bub[i]))
+
+    eps = float(settings["FLOW_TIE_BREAK_EUR_PER_KWH"])
+    degradation = DT * float(settings.get("BESS_DEGRADATION_EUR_PER_KWH", 0.0))
+    objective = gp.LinExpr()
+    for t in range(T):
+        objective += degradation * (x[t] + x[T + t])
+        objective += DT * (pa[t] + pb_values[t] + eps) * x[2 * T + t]
+        objective += DT * (-pa[t] + eps) * x[3 * T + t]
+        objective += float(settings["SOC_SOFT_PENALTY_EUR_PER_KWH"]) * (
+            x[4 * T + t] + x[5 * T + t]
+        )
+    model.setObjective(objective, GRB.MINIMIZE)
+    model.optimize()
+    if model.Status != GRB.OPTIMAL:
+        raise RuntimeError(f"Warm-start follower {bus}: status={model.Status}")
+    values = np.array([x[j].X for j in range(q)], dtype=float)
+    return values, {
+        "objective": float(model.ObjVal),
+        "max_eq_residual": float(np.max(np.abs(aeq @ values - beq))),
+        "max_ineq_violation": float(np.max(np.maximum(aub @ values - bub, 0.0))),
+    }
+
+
+def add_kkt(model, bus, baseline, pa, pb, settings, primal_start=None):
+    aeq, beq, aub, bub, lb, ub = follower_lp(bus, baseline, settings)
+    q = len(lb)
     tag = bus.replace(" ", "_")
 
     x = model.addVars(q, lb=-GRB.INFINITY, name=f"x_{tag}")
@@ -91,6 +157,9 @@ def add_kkt(model, bus, baseline, pa, pb, settings):
         ub=settings["DUAL_BIG_M"],
         name=f"mu_{tag}",
     )
+    if primal_start is not None:
+        for j in range(q):
+            x[j].Start = float(primal_start[j])
 
     for i, row in enumerate(aeq):
         nz = np.flatnonzero(row)
@@ -113,8 +182,8 @@ def add_kkt(model, bus, baseline, pa, pb, settings):
             bub[i] - lhs,
             bub[i] - minimum_lhs,
             mu[i],
-            f"ineq_{tag}_{i}",
-            settings["DUAL_BIG_M"],
+            f"ineq_{tag}_{i}", settings["DUAL_BIG_M"],
+            None if primal_start is None else bub[i] - float(row @ primal_start),
         )
 
     lower_dual, upper_dual = {}, {}
@@ -143,6 +212,7 @@ def add_kkt(model, bus, baseline, pa, pb, settings):
             lower_dual[j],
             f"lb_{tag}_{j}",
             settings["DUAL_BIG_M"],
+            None if primal_start is None else float(primal_start[j] - lb[j]),
         )
         complementarity(
             model,
@@ -151,21 +221,36 @@ def add_kkt(model, bus, baseline, pa, pb, settings):
             upper_dual[j],
             f"ub_{tag}_{j}",
             settings["DUAL_BIG_M"],
+            None if primal_start is None else float(ub[j] - primal_start[j]),
         )
 
     eps = float(settings["FLOW_TIE_BREAK_EUR_PER_KWH"])
+    has_degradation = float(settings.get("BESS_DEGRADATION_EUR_PER_KWH", 0.0)) > 0.0
+    degradation = DT * float(settings.get("BESS_DEGRADATION_EUR_PER_KWH", 0.0))
 
     for j in range(q):
-        if j < T:
-            cost = 0.0
-        elif j < 2 * T:
-            t = j - T
-            cost = DT * (pa[t] + pb[t] + eps)
-        elif j < 3 * T:
-            t = j - 2 * T
-            cost = DT * (-pa[t] + eps)
+        if has_degradation:
+            if j < 2 * T:
+                cost = degradation
+            elif j < 3 * T:
+                t = j - 2 * T
+                cost = DT * (pa[t] + pb[t] + eps)
+            elif j < 4 * T:
+                t = j - 3 * T
+                cost = DT * (-pa[t] + eps)
+            else:
+                cost = float(settings["SOC_SOFT_PENALTY_EUR_PER_KWH"])
         else:
-            cost = float(settings["SOC_SOFT_PENALTY_EUR_PER_KWH"])
+            if j < T:
+                cost = 0.0
+            elif j < 2 * T:
+                t = j - T
+                cost = DT * (pa[t] + pb[t] + eps)
+            elif j < 3 * T:
+                t = j - 2 * T
+                cost = DT * (-pa[t] + eps)
+            else:
+                cost = float(settings["SOC_SOFT_PENALTY_EUR_PER_KWH"])
 
         equality_terms = gp.quicksum(
             aeq[i, j] * lam[i]
@@ -205,6 +290,13 @@ def solve_day(date, loads, pv, pa, settings):
         ub=settings["PB_MAX"],
         name="PB",
     )
+    pb_warm = settings.get("PB_WARM_START")
+    if pb_warm is not None:
+        pb_warm = np.asarray(pb_warm, dtype=float)
+        if len(pb_warm) != T:
+            raise ValueError(f"PB_WARM_START must contain {T} values")
+        for t in range(T):
+            pb[t].Start = float(pb_warm[t])
 
     if settings["ENFORCE_PB_DAILY_MEAN"]:
         model.addConstr(
@@ -215,8 +307,24 @@ def solve_day(date, loads, pv, pa, settings):
     for t in range(1, T):
         model.addConstr(pb[t] - pb[t - 1] <= settings["PB_RAMP"])
         model.addConstr(pb[t - 1] - pb[t] <= settings["PB_RAMP"])
+    previous_pb = settings.get("PB_PREVIOUS_EUR_PER_KWH")
+    if previous_pb is not None:
+        model.addConstr(pb[0] - float(previous_pb) <= settings["PB_RAMP"])
+        model.addConstr(float(previous_pb) - pb[0] <= settings["PB_RAMP"])
 
     x = {}
+    has_degradation = float(settings.get("BESS_DEGRADATION_EUR_PER_KWH", 0.0)) > 0.0
+    primal_starts = {}
+    if pb_warm is not None and has_degradation:
+        for bus in BUS_ORDER:
+            primal_starts[bus], info = follower_primal_warm_start(
+                bus, loads[bus] - pv[bus], pa, pb_warm, settings
+            )
+            print(
+                f"[S3][WARM] {bus}: objective={info['objective']:.6f}, "
+                f"eq_res={info['max_eq_residual']:.2e}, "
+                f"ineq_violation={info['max_ineq_violation']:.2e}", flush=True,
+            )
     for idx, bus in enumerate(BUS_ORDER, start=1):
         print(
             f"[S3][BUILD] follower {idx}/{len(BUS_ORDER)}: "
@@ -230,6 +338,7 @@ def solve_day(date, loads, pv, pa, settings):
             pa,
             pb,
             settings,
+            primal_start=primal_starts.get(bus),
         )
         model.update()
         print(
@@ -240,16 +349,34 @@ def solve_day(date, loads, pv, pa, settings):
 
     peak = model.addVar(lb=-GRB.INFINITY, name="peak")
     valley = model.addVar(lb=-GRB.INFINITY, name="valley")
-
+    aggregates = []
     for t in range(T):
         aggregate = gp.quicksum(
-            x[bus][T + t] - x[bus][2 * T + t]
+            (x[bus][2 * T + t] - x[bus][3 * T + t])
+            if has_degradation else
+            (x[bus][T + t] - x[bus][2 * T + t])
             for bus in BUS_ORDER
         )
+        aggregates.append(aggregate)
         model.addConstr(peak >= aggregate)
         model.addConstr(valley <= aggregate)
 
-    model.setObjective(peak - valley, GRB.MINIMIZE)
+    ramp_weight = float(settings.get("LEADER_RAMP_WEIGHT", 0.0))
+    ramp_terms = []
+    previous_grid = settings.get("LEADER_PREVIOUS_GRID_KW")
+    if ramp_weight > 0.0 and previous_grid is not None:
+        ramp0 = model.addVar(lb=0.0, name="leader_grid_ramp_0")
+        model.addConstr(ramp0 >= aggregates[0] - float(previous_grid))
+        model.addConstr(ramp0 >= float(previous_grid) - aggregates[0])
+        ramp_terms.append(ramp0)
+    if ramp_weight > 0.0:
+        for t in range(1, T):
+            ramp_abs = model.addVar(lb=0.0, name=f"leader_grid_ramp_{t}")
+            model.addConstr(ramp_abs >= aggregates[t] - aggregates[t - 1])
+            model.addConstr(ramp_abs >= aggregates[t - 1] - aggregates[t])
+            ramp_terms.append(ramp_abs)
+    ramp_l1 = gp.quicksum(ramp_terms) if ramp_terms else 0.0
+    model.setObjective(peak - valley + ramp_weight * ramp_l1, GRB.MINIMIZE)
     model.update()
 
     print(
@@ -290,10 +417,17 @@ def solve_day(date, loads, pv, pa, settings):
     result = {}
 
     for bus in BUS_ORDER:
-        values = np.array([x[bus][j].X for j in range(3 * T)])
-        bess, imp, exp = np.split(values, 3)
+        if has_degradation:
+            values = np.array([x[bus][j].X for j in range(4 * T)])
+            charge, discharge, imp, exp = np.split(values, 4)
+            bess = charge - discharge
+        else:
+            values = np.array([x[bus][j].X for j in range(3 * T)])
+            bess, imp, exp = np.split(values, 3)
         cfg = BUS_CONFIG[bus]
-        energy = cfg["bess_e_init"] + np.r_[0.0, np.cumsum(DT * bess)]
+        initial_by_bus = settings.get("BESS_INITIAL_ENERGY_KWH", {})
+        initial_energy = float(initial_by_bus.get(bus, cfg["bess_e_init"]))
+        energy = initial_energy + np.r_[0.0, np.cumsum(DT * bess)]
 
         result[bus] = make_result_item(
             bess,

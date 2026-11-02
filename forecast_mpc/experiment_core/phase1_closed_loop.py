@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import hashlib
+import json
 from pathlib import Path
 import sys
 import time
@@ -15,8 +16,12 @@ from experiment_core.stackelberg_mpc import (
     BUS_CONFIG, BUS_ORDER, DT, HORIZON, PHASE4_SETTINGS,
     _solve_stackelberg_window,
 )
+from experiment_core.load_process import (
+    build_realization, causal_forecast, save_realization, ensure_run_manifest,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
+SOFT_SOC_ROOT = ROOT / "soft_soc_simulations"
 PROJECT_ROOT = ROOT.parent
 PHASE4 = PROJECT_ROOT / "stackelberg_scenario_analysis" / "phase4"
 if str(PHASE4) not in sys.path:
@@ -29,14 +34,18 @@ SIM_STEPS = 3 * 96
 BASE_SEED = 20250903
 SIGMA_EPSILON_KW = 0.3
 AR1_RHO = 0.9
+PHYSICAL_SIGMA_KW = 0.3
 PV_ACTIVE_THRESHOLD_KW = 0.01
-INITIAL_MPC_TIME_LIMIT_S = 1200.0
-ROLLING_MPC_TIME_LIMIT_S = 900.0
+MPC_MIP_GAP = 0.05
+MPC_TIME_LIMIT_S = 600.0
+MPC_INITIAL_TIME_LIMIT_S = 180.0
+MPC_RETRY_TIME_LIMIT_S = None
+PROGRESS_HOOK = None
 
 EXPERIMENTS = {
-    "t5_perfect": ("perfect", ROOT / "t5_perfect_mpc_mpc" / "results_soft_soc_3days"),
-    "t5": ("iid", ROOT / "t5_iid_mpc_mpc" / "results_soft_soc_3days"),
-    "t6": ("ar1", ROOT / "t6_ar1_mpc_mpc" / "results_soft_soc_3days"),
+    "t5_perfect": ("perfect", SOFT_SOC_ROOT / "t56_3days" / "t5_perfect"),
+    "t5": ("iid", SOFT_SOC_ROOT / "t56_3days" / "t5_iid"),
+    "t6": ("ar1", SOFT_SOC_ROOT / "t56_3days" / "t6_ar1"),
 }
 
 
@@ -45,7 +54,9 @@ def _seed(*parts) -> int:
     return int.from_bytes(hashlib.sha256(token).digest()[:8], "little")
 
 
-def _load_period():
+def _load_period(sim_steps=None, forecast_horizon=None, scenario="perfect"):
+    sim_steps = SIM_STEPS if sim_steps is None else sim_steps
+    forecast_horizon = HORIZON if forecast_horizon is None else forecast_horizon
     settings = deepcopy(PHASE4_SETTINGS)
     settings["LOAD_MODE"] = "annual"
     settings["SOLVER_OUTPUT"] = 1
@@ -53,7 +64,10 @@ def _load_period():
     pv_source = read_pv_source(settings)
     profiles, full_days = load_simbench_profiles(settings)
     parts = []
-    for offset in range(3):
+    # Three days are executed. One additional calendar day is loaded so that
+    # the final updates retain the full 16-step (4 h) prediction horizon.
+    planning_days = (sim_steps + forecast_horizon - 1 + 95) // 96
+    for offset in range(planning_days):
         date = START_DATE + pd.Timedelta(days=offset)
         loads, pv, pa = day_inputs(date, profiles, full_days, pa_year, pv_source, settings)
         parts.append((date, loads, pv, pa))
@@ -64,36 +78,19 @@ def _load_period():
         realization["pv"][bus][realization["pv"][bus] < PV_ACTIVE_THRESHOLD_KW] = 0.0
     pa = np.concatenate([p[3] for p in parts])
     timestamps = pd.date_range(START_DATE, periods=len(pa), freq="15min")
-    return settings, realization, pa, timestamps
+    return settings, build_realization(
+        realization,
+        scenario,
+        seed=BASE_SEED,
+        sigma_w=PHYSICAL_SIGMA_KW,
+        rho=AR1_RHO,
+    ), pa, timestamps
 
 
-def _forecast(realization, scenario, origin, horizon=HORIZON):
-    forecast = {v: {} for v in ("load", "pv")}
-    for variable in forecast:
-        for bus in BUS_ORDER:
-            actual = realization[variable][bus][origin:origin + horizon].copy()
-            if scenario == "perfect":
-                error = np.zeros(horizon)
-            else:
-                rng = np.random.default_rng(_seed(scenario, origin, bus, variable))
-                if scenario == "iid":
-                    error = rng.normal(0.0, SIGMA_EPSILON_KW, horizon)
-                else:
-                    error = np.zeros(horizon)
-                    if horizon > 1:
-                        error[1] = rng.normal(0.0, SIGMA_EPSILON_KW / np.sqrt(1.0 - AR1_RHO**2))
-                    for lead in range(2, horizon):
-                        error[lead] = AR1_RHO * error[lead - 1] + rng.normal(0.0, SIGMA_EPSILON_KW)
-                error[0] = 0.0  # current measurement is known exactly
-            values = actual + error
-            if variable == "pv":
-                active = actual >= PV_ACTIVE_THRESHOLD_KW
-                capacity = float(PHASE4_SETTINGS["PV_CAPACITY_KW"][bus])
-                values = np.where(active, np.clip(values, 0.0, capacity), 0.0)
-            else:
-                values = np.maximum(values, 0.0)
-            forecast[variable][bus] = values
-    return forecast
+def _forecast(realization, scenario, origin, horizon=None):
+    if horizon is None:
+        horizon = HORIZON
+    return causal_forecast(realization, scenario, origin, horizon)
 
 
 def _metrics(name, frame):
@@ -107,7 +104,7 @@ def _metrics(name, frame):
         rows.append({"experiment": name, "period": period,
                      "peak_kw": net.max(), "valley_kw": net.min(), "peak_valley_kw": np.ptp(net),
                      "uncontrolled_peak_valley_kw": np.ptp(base),
-                     "max_abs_ramp_kw": np.max(np.abs(np.diff(net))),
+                     "max_abs_ramp_kw": float(np.max(np.abs(np.diff(net)))) if len(net) > 1 else 0.0,
                      "import_energy_kwh": np.maximum(net, 0).sum() * DT,
                      "export_energy_kwh": np.maximum(-net, 0).sum() * DT,
                      "bess_throughput_kwh": np.abs(data.bess_kw).sum() * DT})
@@ -144,7 +141,7 @@ def _plot(name, frame, plans, output):
     axes[0, 1].set_ylabel("Net load (kW)")
     axes[1, 0].set_ylabel("Power (kW)")
     axes[1, 1].set_ylabel("PB (EUR/kWh)")
-    fig.suptitle(f"{name}: 48 h strict rolling Stackelberg MPC", fontsize=13)
+    fig.suptitle(f"{name}: {SIM_STEPS * DT:g} h rolling Stackelberg MPC", fontsize=13)
     fig.tight_layout()
     fig.savefig(output / "stackelberg_mpc_overview_3days.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -154,7 +151,21 @@ def run(name):
     scenario, output = EXPERIMENTS[name]
     output.mkdir(parents=True, exist_ok=True)
     print(f"[{name}] Loading continuous SimBench/price/PV data...", flush=True)
-    _, actual, pa, timestamps = _load_period()
+    _, actual, pa, timestamps = _load_period(scenario=scenario)
+    ensure_run_manifest(output, {
+        "method": name, "scenario": scenario, "steps": SIM_STEPS, "horizon": HORIZON,
+        "c_deg": float(PHASE4_SETTINGS["BESS_DEGRADATION_EUR_PER_KWH"]),
+        "c_ramp": float(PHASE4_SETTINGS.get("LEADER_RAMP_WEIGHT", 0.0)),
+        "mip_gap": MPC_MIP_GAP, "process": actual["process"],
+        "solver_settings": json.loads(json.dumps(PHASE4_SETTINGS, default=str)),
+    })
+    save_realization(actual, timestamps, output)
+    final_path = output / "mpc_timeseries.csv"
+    if final_path.exists():
+        completed = pd.read_csv(final_path)
+        if len(completed) == SIM_STEPS and completed.step.tolist() == list(range(SIM_STEPS)):
+            print(f"[{name}] Already complete: {SIM_STEPS}/{SIM_STEPS}", flush=True)
+            return
     energy = {b: float(BUS_CONFIG[b]["bess_e_init"]) for b in BUS_ORDER}
     previous_pb = None
     warm_pb = None
@@ -177,9 +188,20 @@ def run(name):
             if partial_solver.exists():
                 solver_rows = pd.read_csv(partial_solver, parse_dates=["timestamp"]).to_dict("records")
             if partial_plans.exists():
-                plan_rows = pd.read_csv(
+                saved_plans = pd.read_csv(
                     partial_plans, parse_dates=["origin_timestamp", "target_timestamp"]
-                ).to_dict("records")
+                )
+                plan_rows = saved_plans.to_dict("records")
+                # Continue with the shifted tariff trajectory of the last solved
+                # MPC window instead of restarting the MILP from a flat guess.
+                last_origin = int(saved_plans["origin_step"].max())
+                last_pb = (
+                    saved_plans.loc[saved_plans["origin_step"] == last_origin]
+                    .groupby("lead")["planned_pb_eur_per_kwh"]
+                    .first().sort_index().to_numpy(dtype=float)
+                )
+                if len(last_pb) and np.isfinite(last_pb).all():
+                    warm_pb = np.r_[last_pb[1:], last_pb[-1]][:HORIZON]
             else:
                 # The older checkpoint format did not persist rolling plans.
                 # Recreate its deterministic forecasts; unavailable optimized
@@ -202,13 +224,34 @@ def run(name):
     started = time.time()
     for origin in range(start_origin, SIM_STEPS):
         forecast = _forecast(actual, scenario, origin)
-        # Cold-start updates need more time on slower machines. Later updates
-        # benefit from the shifted tariff warm start but retain a generous cap.
-        limit = INITIAL_MPC_TIME_LIMIT_S if origin < 2 else ROLLING_MPC_TIME_LIMIT_S
+        # Per-run time limits are supplied by the versioned experiment runner.
+        limit = MPC_INITIAL_TIME_LIMIT_S if origin < 2 else MPC_TIME_LIMIT_S
         print(f"\n[{name}] MPC {origin + 1:03d}/{SIM_STEPS} | {timestamps[origin]} | limit={limit:.0f}s", flush=True)
-        solution = _solve_stackelberg_window(
-            timestamps[origin], origin, forecast, energy, pa[origin:origin + HORIZON],
-            previous_pb, None, warm_pb=warm_pb, mip_gap=0.05, time_limit_s=limit)
+        try:
+            previous_realized_net = (
+                float(series_rows[-1]["realized_net_kw"])
+                if series_rows and float(PHASE4_SETTINGS.get("LEADER_RAMP_WEIGHT", 0.0)) > 0.0
+                else None
+            )
+            solution = _solve_stackelberg_window(
+                timestamps[origin], origin, forecast, energy, pa[origin:origin + HORIZON],
+                previous_pb, None, warm_pb=warm_pb, mip_gap=MPC_MIP_GAP,
+                time_limit_s=limit, previous_realized_net=previous_realized_net)
+        except RuntimeError as exc:
+            if MPC_RETRY_TIME_LIMIT_S is None or "no incumbent" not in str(exc):
+                raise
+            retry_limit = float(MPC_RETRY_TIME_LIMIT_S)
+            print(f"[{name}] no incumbent after {limit:.0f}s; retrying this window "
+                  f"with {retry_limit:.0f}s", flush=True)
+            solution = _solve_stackelberg_window(
+                timestamps[origin], origin, forecast, energy, pa[origin:origin + HORIZON],
+                previous_pb, None, warm_pb=warm_pb, mip_gap=MPC_MIP_GAP,
+                time_limit_s=retry_limit, previous_realized_net=previous_realized_net)
+        quality_status = (
+            "gap_target_reached"
+            if solution["gap"] <= float(MPC_MIP_GAP) + 1e-9
+            else "feasible_time_limit"
+        )
         for lead in range(HORIZON):
             for bus in BUS_ORDER:
                 plan_rows.append({"origin_step": origin, "target_step": origin + lead, "lead": lead,
@@ -226,11 +269,20 @@ def run(name):
         realized = uncontrolled + bess
         for bus in BUS_ORDER:
             energy[bus] += DT * solution["actions"][bus]
+            cfg = BUS_CONFIG[bus]
+            if not cfg["bess_e_min"] - 1e-6 <= energy[bus] <= cfg["bess_e_max"] + 1e-6:
+                raise RuntimeError(f"Physical SOC violation at step {origin} for {bus}: {energy[bus]}")
         series_rows.append({"step": origin, "timestamp": timestamps[origin], "uncontrolled_net_kw": uncontrolled,
-                            "realized_net_kw": realized, "bess_kw": bess, "pb_eur_per_kwh": solution["pb"][0],
+                            "realized_net_kw": realized, "bess_kw": bess,
+                            "pa_eur_per_kwh": pa[origin],
+                            "pb_eur_per_kwh": solution["pb"][0],
+                            "total_price_eur_per_kwh": pa[origin] + solution["pb"][0],
                             **{f"soc_{b.replace(' ', '_').lower()}_kwh": energy[b] for b in BUS_ORDER}})
         solver_rows.append({"step": origin, "timestamp": timestamps[origin],
-                            **{k: solution[k] for k in ("status", "objective", "best_bound", "gap", "runtime_s", "nodes")}})
+                            **{k: solution[k] for k in (
+                                "status", "objective", "best_bound", "gap", "runtime_s", "nodes",
+                                "constraint_violation", "bound_violation", "integrality_violation",
+                            )}, "solution_quality": quality_status})
         previous_pb = float(solution["pb"][0])
         warm_pb = np.r_[solution["pb"][1:], solution["pb"][-1]]
         print(f"[{name}] executed: net={realized:.3f} kW, PB={previous_pb:.4f}, "
@@ -238,6 +290,13 @@ def run(name):
         pd.DataFrame(series_rows).to_csv(partial_series, index=False)
         pd.DataFrame(solver_rows).to_csv(partial_solver, index=False)
         pd.DataFrame(plan_rows).to_csv(partial_plans, index=False)
+        (output / "progress.json").write_text(json.dumps({
+            "method": name, "completed_steps": origin + 1, "total_steps": SIM_STEPS,
+            "timestamp": str(timestamps[origin]), "updated_at": pd.Timestamp.now().isoformat(),
+            "last_runtime_s": solution["runtime_s"], "last_mip_gap": solution["gap"],
+        }, indent=2), encoding="utf-8")
+        if PROGRESS_HOOK is not None:
+            PROGRESS_HOOK(name, origin + 1, SIM_STEPS, timestamps[origin])
     frame = pd.DataFrame(series_rows)
     plans = pd.DataFrame(plan_rows)
     frame.to_csv(output / "mpc_timeseries.csv", index=False)
@@ -252,8 +311,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment", choices=["all", *EXPERIMENTS], default="all")
     args = parser.parse_args()
-    for name in EXPERIMENTS if args.experiment == "all" else (args.experiment,):
-        run(name)
+    # The old CLI must not silently resume forecast-noise output directories.
+    import runpy
+    entry = ROOT / "soft_soc_simulations" / "actual_load_noise" / "run_experiments.py"
+    methods = {"t5_perfect": "T56", "t5": "T5", "t6": "T6"}
+    chosen = list(methods.values()) if args.experiment == "all" else [methods[args.experiment]]
+    runpy.run_path(str(entry))["main"](["--methods", *chosen])
 
 
 if __name__ == "__main__":
