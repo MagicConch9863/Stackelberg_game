@@ -9,6 +9,8 @@ __pycache__/
 .vscode/
 .idea/
 .codex_preview/
+.agents/
+.codex/
 Thumbs.db
 Desktop.ini
 ~$*
@@ -25,11 +27,18 @@ Desktop.ini
 **/status/
 *.lock
 *.pid
+*.mst
+*.sol
+*.mps
+*.lp
 slurm-*.out
 slurm-*.err
 
 # Git carries code and thesis sources only. Transfer data/configs separately.
 *.json
+*.jsonl
+*.json5
+*.ndjson
 *.csv
 *.npz
 *.npy
@@ -155,5 +164,8 @@ slprj/
 
 # Explicit compact handover snapshot only; raw result trees stay ignored.
 !/sync_data/*.csv
-!/sync_data/snapshot.json
 !/sync_data/Uebergabe.txt
+
+# Review checkpoints and portable transfer packages are copied outside Git.
+/horizon_screening/review/
+/review_transfer*/

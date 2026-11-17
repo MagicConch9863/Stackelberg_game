@@ -26,8 +26,8 @@ def merge_candidate(best, result):
 def stop_after(limit,best,cfg):
     if best is None:return False
     if limit==60:return best['gap']<=cfg['target_gap']
-    if limit==120:return best['gap']<=cfg['acceptance_gap_after_second']
-    # 300 seconds exhausts the quality retry. 600 seconds is only needed
+    if limit==120:return True
+    # 300 seconds exhausts the quality retry. The final rescue is only needed
     # when no valid incumbent exists after all preceding attempts.
     return limit>=300
 
